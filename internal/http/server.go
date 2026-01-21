@@ -1,0 +1,878 @@
+package httpapi
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"net/http"
+	"strconv"
+	"time"
+
+	"easyusersys/internal/config"
+	"easyusersys/internal/models"
+	"easyusersys/internal/services"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+	"github.com/stripe/stripe-go/v76"
+	"github.com/stripe/stripe-go/v76/checkout/session"
+	"github.com/stripe/stripe-go/v76/webhook"
+)
+
+type Server struct {
+	svc *services.Service
+	cfg config.Config
+}
+
+func NewServer(svc *services.Service, cfg config.Config) *Server {
+	return &Server{svc: svc, cfg: cfg}
+}
+
+func (s *Server) Routes() http.Handler {
+	r := chi.NewRouter()
+	r.Use(middleware.RequestID)
+	r.Use(middleware.RealIP)
+	r.Use(middleware.Recoverer)
+
+	// 公开接口
+	r.Post("/auth/login", s.handleLogin)
+	r.Get("/auth/google", s.handleGoogleLogin)
+	r.Get("/auth/google/callback", s.handleGoogleCallback)
+	r.Post("/users", s.handleCreateUser)
+	r.Get("/users/by-email", s.handleGetUserByEmail)
+	r.Get("/plans", s.handleListPlans)
+	r.Post("/webhooks/stripe", s.handleStripeWebhook)
+
+	// 服务间接口（使用 API Key 验证）
+	r.Post("/usage", s.handleReportUsage)
+
+	// 需要认证的用户接口
+	r.Group(func(r chi.Router) {
+		r.Use(s.jwtMiddleware)
+
+		r.Get("/users/{id}", s.handleGetUser)
+		r.Patch("/users/{id}/status", s.handleUpdateUserStatus)
+		r.Get("/users/{id}/balances", s.handleListBalances)
+		r.Post("/users/{id}/api-keys", s.handleCreateAPIKey)
+		r.Get("/users/{id}/api-keys", s.handleListAPIKeys)
+		r.Post("/api-keys/{id}/revoke", s.handleRevokeAPIKey)
+
+		r.Post("/subscriptions/checkout", s.handleCreateSubscriptionCheckout)
+		r.Post("/subscriptions/{id}/cancel", s.handleCancelSubscription)
+		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+
+		r.Post("/prepaid/checkout", s.handleCreatePrepaidCheckout)
+
+		r.Get("/usage", s.handleListUsage)
+
+		r.Get("/orders/{id}", s.handleGetOrder)
+	})
+
+	// 管理员接口
+	r.Route("/admin", func(r chi.Router) {
+		r.Use(s.jwtMiddleware)
+		r.Use(s.adminMiddleware)
+
+		r.Get("/users", s.handleAdminListUsers)
+		r.Patch("/users/{id}/role", s.handleAdminUpdateUserRole)
+		r.Get("/users/{id}/usage", s.handleAdminGetUserUsage)
+		r.Get("/users/{id}/subscriptions", s.handleAdminGetUserSubscriptions)
+		r.Get("/stats", s.handleAdminGetStats)
+	})
+
+	return r
+}
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Email == "" || req.Password == "" {
+		respondError(w, http.StatusBadRequest, errors.New("email and password are required"))
+		return
+	}
+
+	user, err := s.svc.AuthenticateUser(r.Context(), req.Email, req.Password)
+	if err != nil {
+		if errors.Is(err, services.ErrInvalidCredentials) {
+			respondError(w, http.StatusUnauthorized, err)
+			return
+		}
+		s.respondServiceError(w, err)
+		return
+	}
+
+	token, err := s.generateJWT(user.ID, user.Email, user.Role)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"token": token,
+		"user": map[string]any{
+			"id":    user.ID,
+			"email": user.Email,
+			"role":  user.Role,
+		},
+	})
+}
+
+type createUserRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
+	var req createUserRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Email == "" || req.Password == "" {
+		respondError(w, http.StatusBadRequest, errors.New("email and password are required"))
+		return
+	}
+	user, err := s.svc.CreateUser(r.Context(), req.Email, req.Password)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusCreated, user)
+}
+
+func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 权限验证：只能查看自己的信息，管理员可以查看任何人
+	if !canAccessUser(r.Context(), id) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	user, err := s.svc.GetUserByID(r.Context(), id)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, user)
+}
+
+func (s *Server) handleGetUserByEmail(w http.ResponseWriter, r *http.Request) {
+	email := r.URL.Query().Get("email")
+	if email == "" {
+		respondError(w, http.StatusBadRequest, errors.New("email is required"))
+		return
+	}
+	user, err := s.svc.GetUserByEmail(r.Context(), email)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, user)
+}
+
+type updateUserStatusRequest struct {
+	Status string `json:"status"`
+}
+
+func (s *Server) handleUpdateUserStatus(w http.ResponseWriter, r *http.Request) {
+	// 权限验证：只有管理员可以更新用户状态
+	if !isAdmin(r.Context()) {
+		respondError(w, http.StatusForbidden, errors.New("admin access required"))
+		return
+	}
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	var req updateUserStatusRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.Status == "" {
+		respondError(w, http.StatusBadRequest, errors.New("status is required"))
+		return
+	}
+	if err := s.svc.UpdateUserStatus(r.Context(), id, req.Status); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleListBalances(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 权限验证：只能查看自己的余额，管理员可以查看任何人
+	if !canAccessUser(r.Context(), userID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	balances, err := s.svc.ListBalances(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, balances)
+}
+
+func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 权限验证：只能为自己创建 API Key，管理员可以为任何人创建
+	if !canAccessUser(r.Context(), userID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	raw, key, err := s.svc.CreateAPIKey(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{
+		"raw_key": raw,
+		"api_key": key,
+	})
+}
+
+func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 权限验证：只能查看自己的 API Keys，管理员可以查看任何人
+	if !canAccessUser(r.Context(), userID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	keys, err := s.svc.ListAPIKeys(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, keys)
+}
+
+func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
+	id, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 权限验证：检查 API Key 是否属于当前用户
+	apiKey, err := s.svc.GetAPIKeyByID(r.Context(), id)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !canAccessUser(r.Context(), apiKey.UserID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	if err := s.svc.RevokeAPIKey(r.Context(), id); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleListPlans(w http.ResponseWriter, r *http.Request) {
+	plans, err := s.svc.ListPlans(r.Context())
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, plans)
+}
+
+type createSubscriptionCheckoutRequest struct {
+	UserID     int64  `json:"user_id"`
+	PlanID     int64  `json:"plan_id"`
+	SuccessURL string `json:"success_url"`
+	CancelURL  string `json:"cancel_url"`
+}
+
+func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.StripeSecretKey == "" {
+		s.respondServiceError(w, services.ErrStripeNotConfigured)
+		return
+	}
+	var req createSubscriptionCheckoutRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.UserID == 0 || req.PlanID == 0 || req.SuccessURL == "" || req.CancelURL == "" {
+		respondError(w, http.StatusBadRequest, errors.New("user_id, plan_id, success_url, cancel_url are required"))
+		return
+	}
+	// 权限验证：只能为自己创建订阅，管理员可以为任何人创建
+	if !canAccessUser(r.Context(), req.UserID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+
+	plan, err := s.svc.GetPlanByID(r.Context(), req.PlanID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	priceID, err := s.stripePriceForPlan(plan.Name)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	sub, err := s.svc.CreatePendingSubscription(r.Context(), req.UserID, plan.ID, plan.PeriodDays)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	order, err := s.svc.CreateSubscriptionOrder(r.Context(), req.UserID, sub.ID, plan.PriceCents, plan.GrantPoints)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	stripe.Key = s.cfg.StripeSecretKey
+	params := &stripe.CheckoutSessionParams{
+		Mode:              stripe.String(string(stripe.CheckoutSessionModeSubscription)),
+		SuccessURL:        stripe.String(req.SuccessURL),
+		CancelURL:         stripe.String(req.CancelURL),
+		ClientReferenceID: stripe.String(strconv.FormatInt(order.ID, 10)),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				Price:    stripe.String(priceID),
+				Quantity: stripe.Int64(1),
+			},
+		},
+		Metadata: map[string]string{
+			"order_id":        strconv.FormatInt(order.ID, 10),
+			"subscription_id": strconv.FormatInt(sub.ID, 10),
+			"user_id":         strconv.FormatInt(req.UserID, 10),
+			"plan_id":         strconv.FormatInt(plan.ID, 10),
+		},
+	}
+
+	session, err := session.New(params)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.svc.LinkOrderSession(r.Context(), order.ID, session.ID); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusCreated, map[string]any{
+		"order_id":        order.ID,
+		"subscription_id": sub.ID,
+		"stripe_session":  session.ID,
+		"checkout_url":    session.URL,
+	})
+}
+
+func (s *Server) handleCancelSubscription(w http.ResponseWriter, r *http.Request) {
+	subscriptionID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	sub, err := s.svc.GetSubscriptionByID(r.Context(), subscriptionID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	// 权限验证：只能取消自己的订阅，管理员可以取消任何人的
+	if !canAccessUser(r.Context(), sub.UserID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	if err := s.svc.CancelSubscription(r.Context(), sub.UserID); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
+	subscriptionID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	sub, err := s.svc.GetSubscriptionByID(r.Context(), subscriptionID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	// 权限验证：只能查看自己的订阅，管理员可以查看任何人的
+	if !canAccessUser(r.Context(), sub.UserID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	respondJSON(w, http.StatusOK, sub)
+}
+
+type createPrepaidCheckoutRequest struct {
+	UserID     int64  `json:"user_id"`
+	AmountCents int   `json:"amount_cents"`
+	SuccessURL string `json:"success_url"`
+	CancelURL  string `json:"cancel_url"`
+}
+
+func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.StripeSecretKey == "" {
+		s.respondServiceError(w, services.ErrStripeNotConfigured)
+		return
+	}
+	var req createPrepaidCheckoutRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.UserID == 0 || req.AmountCents <= 0 || req.SuccessURL == "" || req.CancelURL == "" {
+		respondError(w, http.StatusBadRequest, errors.New("user_id, amount_cents, success_url, cancel_url are required"))
+		return
+	}
+	// 权限验证：只能为自己充值，管理员可以为任何人充值
+	if !canAccessUser(r.Context(), req.UserID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+
+	order, err := s.svc.CreatePrepaidOrder(r.Context(), req.UserID, req.AmountCents)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	stripe.Key = s.cfg.StripeSecretKey
+	params := &stripe.CheckoutSessionParams{
+		Mode:              stripe.String(string(stripe.CheckoutSessionModePayment)),
+		SuccessURL:        stripe.String(req.SuccessURL),
+		CancelURL:         stripe.String(req.CancelURL),
+		ClientReferenceID: stripe.String(strconv.FormatInt(order.ID, 10)),
+		LineItems: []*stripe.CheckoutSessionLineItemParams{
+			{
+				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
+					Currency: stripe.String(s.cfg.StripeCurrency),
+					UnitAmount: stripe.Int64(int64(req.AmountCents)),
+					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
+						Name: stripe.String("Prepaid Points"),
+					},
+				},
+				Quantity: stripe.Int64(1),
+			},
+		},
+		Metadata: map[string]string{
+			"order_id": strconv.FormatInt(order.ID, 10),
+			"user_id":  strconv.FormatInt(req.UserID, 10),
+		},
+	}
+	session, err := session.New(params)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if err := s.svc.LinkOrderSession(r.Context(), order.ID, session.ID); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusCreated, map[string]any{
+		"order_id":       order.ID,
+		"stripe_session": session.ID,
+		"checkout_url":   session.URL,
+	})
+}
+
+type reportUsageRequest struct {
+	UserID    int64  `json:"user_id"`
+	Units     int    `json:"units"`
+	RequestID string `json:"request_id"`
+}
+
+func (s *Server) handleReportUsage(w http.ResponseWriter, r *http.Request) {
+	// 服务间认证：验证 API Key
+	if s.cfg.UsageAPIKey == "" {
+		respondError(w, http.StatusServiceUnavailable, errors.New("usage API key not configured"))
+		return
+	}
+	apiKey := r.Header.Get("X-API-Key")
+	if apiKey == "" {
+		respondError(w, http.StatusUnauthorized, errors.New("missing X-API-Key header"))
+		return
+	}
+	if apiKey != s.cfg.UsageAPIKey {
+		respondError(w, http.StatusUnauthorized, errors.New("invalid API key"))
+		return
+	}
+
+	var req reportUsageRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	usage, err := s.svc.ReportUsage(r.Context(), req.UserID, req.Units, req.RequestID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusCreated, usage)
+}
+
+func (s *Server) handleListUsage(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(r.URL.Query().Get("user_id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	// 权限验证：只能查看自己的用量，管理员可以查看任何人
+	if !canAccessUser(r.Context(), userID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	from, to, err := parseRange(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	records, err := s.svc.ListUsage(r.Context(), userID, from, to)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	respondJSON(w, http.StatusOK, records)
+}
+
+func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
+	orderID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	order, err := s.svc.GetOrder(r.Context(), orderID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	// 权限验证：只能查看自己的订单，管理员可以查看任何人的
+	if !canAccessUser(r.Context(), order.UserID) {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
+	respondJSON(w, http.StatusOK, order)
+}
+
+func (s *Server) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.StripeWebhookSecret == "" {
+		s.respondServiceError(w, services.ErrStripeNotConfigured)
+		return
+	}
+	payload, err := io.ReadAll(r.Body)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	sigHeader := r.Header.Get("Stripe-Signature")
+	event, err := webhook.ConstructEvent(payload, sigHeader, s.cfg.StripeWebhookSecret)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	switch event.Type {
+	case "checkout.session.completed":
+		var sess stripe.CheckoutSession
+		if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.processCheckoutSession(r.Context(), &sess); err != nil {
+			s.respondServiceError(w, err)
+			return
+		}
+	case "invoice.paid":
+		var inv stripe.Invoice
+		if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
+			respondError(w, http.StatusBadRequest, err)
+			return
+		}
+		if err := s.processInvoicePaid(r.Context(), &inv); err != nil {
+			s.respondServiceError(w, err)
+			return
+		}
+	default:
+	}
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) processCheckoutSession(ctx context.Context, sess *stripe.CheckoutSession) error {
+	var order models.Order
+	var err error
+
+	if sess.ClientReferenceID != "" {
+		if orderID, parseErr := strconv.ParseInt(sess.ClientReferenceID, 10, 64); parseErr == nil {
+			order, err = s.svc.GetOrder(ctx, orderID)
+		}
+	}
+	if err != nil || order.ID == 0 {
+		order, err = s.svc.GetOrderByStripeSessionID(ctx, sess.ID)
+	}
+	if err != nil {
+		return err
+	}
+
+	stripeSubID := ""
+	if sess.Subscription != nil {
+		stripeSubID = sess.Subscription.ID
+	}
+	stripePaymentID := ""
+	if sess.PaymentIntent != nil {
+		stripePaymentID = sess.PaymentIntent.ID
+	}
+	paidOrder, err := s.svc.MarkOrderPaid(ctx, order.ID, sess.ID, stripePaymentID, stripeSubID)
+	if err != nil {
+		return err
+	}
+	if paidOrder.OrderType != models.OrderTypeSubscription || paidOrder.SubscriptionID == nil {
+		return nil
+	}
+	sub, err := s.svc.GetSubscriptionByID(ctx, *paidOrder.SubscriptionID)
+	if err != nil {
+		return err
+	}
+	if sub.Status == models.SubscriptionActive && sub.EndsAt.After(time.Now().UTC()) {
+		return nil
+	}
+	plan, err := s.svc.GetPlanByID(ctx, sub.PlanID)
+	if err != nil {
+		return err
+	}
+	return s.svc.ActivateSubscription(ctx, sub.ID, stripeSubID, plan.GrantPoints, plan.PeriodDays)
+}
+
+func (s *Server) processInvoicePaid(ctx context.Context, inv *stripe.Invoice) error {
+	if inv.Subscription == nil || inv.Subscription.ID == "" {
+		return nil
+	}
+	sub, err := s.svc.GetSubscriptionByStripeID(ctx, inv.Subscription.ID)
+	if err != nil {
+		if errors.Is(err, services.ErrNotFound) {
+			return nil
+		}
+		return err
+	}
+	if sub.EndsAt.After(time.Now().UTC().Add(1 * time.Hour)) {
+		return nil
+	}
+	plan, err := s.svc.GetPlanByID(ctx, sub.PlanID)
+	if err != nil {
+		return err
+	}
+	return s.svc.ActivateSubscription(ctx, sub.ID, inv.Subscription.ID, plan.GrantPoints, plan.PeriodDays)
+}
+
+func (s *Server) respondServiceError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, services.ErrNotFound):
+		respondError(w, http.StatusNotFound, err)
+	case errors.Is(err, services.ErrInvalidRequest):
+		respondError(w, http.StatusBadRequest, err)
+	case errors.Is(err, services.ErrDuplicateRequest):
+		respondError(w, http.StatusConflict, err)
+	case errors.Is(err, services.ErrInsufficientPoints):
+		respondError(w, http.StatusConflict, err)
+	case errors.Is(err, services.ErrSubscriptionRequired):
+		respondError(w, http.StatusForbidden, err)
+	case errors.Is(err, services.ErrStripeNotConfigured):
+		respondError(w, http.StatusServiceUnavailable, err)
+	default:
+		respondError(w, http.StatusInternalServerError, err)
+	}
+}
+
+func (s *Server) stripePriceForPlan(name string) (string, error) {
+	switch name {
+	case "monthly":
+		if s.cfg.StripePriceMonthly == "" {
+			return "", errors.New("stripe monthly price not configured")
+		}
+		return s.cfg.StripePriceMonthly, nil
+	case "quarterly":
+		if s.cfg.StripePriceQuarterly == "" {
+			return "", errors.New("stripe quarterly price not configured")
+		}
+		return s.cfg.StripePriceQuarterly, nil
+	default:
+		return "", errors.New("unknown plan name")
+	}
+}
+
+func parseID(raw string) (int64, error) {
+	if raw == "" {
+		return 0, errors.New("id is required")
+	}
+	return strconv.ParseInt(raw, 10, 64)
+}
+
+func parseRange(r *http.Request) (time.Time, time.Time, error) {
+	now := time.Now().UTC()
+	fromRaw := r.URL.Query().Get("from")
+	toRaw := r.URL.Query().Get("to")
+	if fromRaw == "" && toRaw == "" {
+		return now.Add(-30 * 24 * time.Hour), now, nil
+	}
+	if fromRaw == "" || toRaw == "" {
+		return time.Time{}, time.Time{}, errors.New("from and to are required together")
+	}
+	from, err := time.Parse(time.RFC3339, fromRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	to, err := time.Parse(time.RFC3339, toRaw)
+	if err != nil {
+		return time.Time{}, time.Time{}, err
+	}
+	return from, to, nil
+}
+
+func parsePagination(r *http.Request) (int, int) {
+	page := 1
+	pageSize := 20
+
+	if p := r.URL.Query().Get("page"); p != "" {
+		if parsed, err := strconv.Atoi(p); err == nil && parsed > 0 {
+			page = parsed
+		}
+	}
+	if ps := r.URL.Query().Get("page_size"); ps != "" {
+		if parsed, err := strconv.Atoi(ps); err == nil && parsed > 0 && parsed <= 100 {
+			pageSize = parsed
+		}
+	}
+	return page, pageSize
+}
+
+// ========== 管理员接口 Handlers ==========
+
+func (s *Server) handleAdminListUsers(w http.ResponseWriter, r *http.Request) {
+	page, pageSize := parsePagination(r)
+
+	users, total, err := s.svc.ListUsers(r.Context(), page, pageSize)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]any{
+		"users":     users,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
+
+type updateUserRoleRequest struct {
+	Role string `json:"role"`
+}
+
+func (s *Server) handleAdminUpdateUserRole(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	var req updateUserRoleRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	if req.Role == "" {
+		respondError(w, http.StatusBadRequest, errors.New("role is required"))
+		return
+	}
+
+	if err := s.svc.UpdateUserRole(r.Context(), userID, req.Role); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleAdminGetUserUsage(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	from, to, err := parseRange(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	records, err := s.svc.ListUsage(r.Context(), userID, from, to)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, records)
+}
+
+func (s *Server) handleAdminGetUserSubscriptions(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	subs, err := s.svc.GetUserSubscriptions(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, subs)
+}
+
+func (s *Server) handleAdminGetStats(w http.ResponseWriter, r *http.Request) {
+	from, to, err := parseRange(r)
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	stats, err := s.svc.GetStats(r.Context(), from, to)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, stats)
+}

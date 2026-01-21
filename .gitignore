@@ -1,0 +1,71 @@
+# 环境变量文件（包含敏感信息）
+.env
+.env.local
+.env.*.local
+
+# Go 编译产物
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+bin/
+dist/
+
+# Go 依赖（可选，通常会提交 go.sum）
+# vendor/
+
+# IDE 和编辑器配置
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# 操作系统文件
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+
+# 日志文件
+*.log
+logs/
+
+# 测试覆盖率
+coverage.out
+coverage.html
+*.coverprofile
+
+# 临时文件
+tmp/
+temp/
+*.tmp
+*.temp
+
+# Python（迁移工具相关）
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+*.pyo
+.pytest_cache/
+venv/
+.venv/
+
+# 数据库文件（如果使用 SQLite 进行本地测试）
+*.db
+*.sqlite
+*.sqlite3
+
+# 调试文件
+debug
+*.pprof
