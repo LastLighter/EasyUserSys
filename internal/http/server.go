@@ -34,6 +34,7 @@ func (s *Server) Routes() http.Handler {
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
 	r.Use(middleware.Recoverer)
+	r.Use(s.corsMiddleware)
 
 	// 公开接口
 	r.Post("/auth/login", s.handleLogin)
@@ -82,6 +83,20 @@ func (s *Server) Routes() http.Handler {
 	})
 
 	return r
+}
+
+func (s *Server) corsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET,POST,PATCH,PUT,DELETE,OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization,Content-Type,X-API-Key")
+		w.Header().Set("Access-Control-Max-Age", "86400")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 type loginRequest struct {
