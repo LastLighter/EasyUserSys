@@ -59,7 +59,8 @@ Authorization: Bearer <your_jwt_token>
 | 403 | 禁止访问（无权限或无有效订阅） |
 | 404 | 资源不存在 |
 | 409 | 冲突（如重复请求、积分不足） |
-| 503 | 服务不可用（如 Stripe 未配置） |
+| 429 | 请求过于频繁（如验证码发送频率限制） |
+| 503 | 服务不可用（如 Stripe/邮件服务 未配置） |
 
 ---
 
@@ -187,6 +188,162 @@ window.location.href = '/auth/google?system_code=demo';
 - 首次登录会自动创建用户，并赠送免费积分（与邮箱注册相同）
 - 如果邮箱已存在（之前用密码注册），会自动绑定 Google 账号
 - 已禁用的用户无法通过 Google 登录
+
+---
+
+### 发送验证码
+
+`POST /auth/send-verification-code` **公开**
+
+发送邮箱验证码，用于注册验证或找回密码。每个邮箱每分钟最多发送 1 次。
+
+**请求**：
+```json
+{
+  "system_code": "demo",
+  "email": "user@example.com",
+  "code_type": "reset_password"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| system_code | string | 是 | 系统标识（租户） |
+| email | string | 是 | 用户邮箱 |
+| code_type | string | 是 | 验证码类型 |
+
+**验证码类型**：
+| 类型 | 说明 |
+|------|------|
+| `signup` | 注册验证（可用于验证邮箱真实性） |
+| `reset_password` | 密码重置（用户必须已存在） |
+
+**响应**（200）：
+```json
+{
+  "status": "ok",
+  "message": "verification code sent"
+}
+```
+
+**错误情况**：
+| 状态码 | 场景 |
+|--------|------|
+| 400 | 缺少必要参数或 code_type 无效 |
+| 404 | `reset_password` 类型时用户不存在 |
+| 429 | 请求过于频繁（1分钟内只能发送1次） |
+| 503 | 邮件服务未配置（API Key 或该 system_code 的发件人未配置） |
+
+**多应用邮件配置**：
+
+邮件发送支持多应用配置，每个 `system_code` 可以有不同的发件人地址。配置方式如下：
+
+```bash
+# API Key 和过期时间是共享的
+RESEND_API_KEY=re_xxx
+VERIFICATION_CODE_EXPIRY_MINUTES=10
+
+# 多应用邮件配置（JSON 格式，按 system_code 区分）
+RESEND_EMAIL_CONFIGS={"appA":{"from_email":"noreply@appA.com"},"appB":{"from_email":"noreply@appB.com"}}
+
+# 兼容旧配置（会作为 "default" 配置，当 system_code 无对应配置时使用）
+RESEND_FROM_EMAIL=noreply@yourdomain.com
+```
+
+---
+
+### 验证验证码
+
+`POST /auth/verify-code` **公开**
+
+验证邮箱验证码是否正确有效。
+
+**请求**：
+```json
+{
+  "system_code": "demo",
+  "email": "user@example.com",
+  "code": "123456",
+  "code_type": "reset_password"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| system_code | string | 是 | 系统标识（租户） |
+| email | string | 是 | 用户邮箱 |
+| code | string | 是 | 6位数字验证码 |
+| code_type | string | 是 | 验证码类型 |
+
+**响应**（200）：
+```json
+{
+  "status": "ok",
+  "message": "code verified"
+}
+```
+
+**错误情况**：
+| 状态码 | 场景 |
+|--------|------|
+| 400 | 验证码错误、已过期或已使用 |
+
+---
+
+### 重置密码
+
+`POST /auth/reset-password` **公开**
+
+使用验证码重置用户密码。需要先获取验证码。
+
+**请求**：
+```json
+{
+  "system_code": "demo",
+  "email": "user@example.com",
+  "code": "123456",
+  "new_password": "your_new_secure_password"
+}
+```
+
+| 字段 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| system_code | string | 是 | 系统标识（租户） |
+| email | string | 是 | 用户邮箱 |
+| code | string | 是 | 6位数字验证码 |
+| new_password | string | 是 | 新密码 |
+
+**响应**（200）：
+```json
+{
+  "status": "ok",
+  "message": "password reset successfully"
+}
+```
+
+**错误情况**：
+| 状态码 | 场景 |
+|--------|------|
+| 400 | 验证码错误、已过期或已使用 |
+| 404 | 用户不存在 |
+
+**找回密码流程**：
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  1. 用户输入邮箱，点击「发送验证码」                               │
+│                              ↓                                  │
+│  2. 前端调用 POST /auth/send-verification-code                  │
+│     { code_type: "reset_password" }                            │
+│                              ↓                                  │
+│  3. 用户收到验证码邮件                                            │
+│                              ↓                                  │
+│  4. 用户输入验证码和新密码                                         │
+│                              ↓                                  │
+│  5. 前端调用 POST /auth/reset-password                          │
+│                              ↓                                  │
+│  6. 密码重置成功，引导用户登录                                      │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -1083,14 +1240,77 @@ async function getUserBalance(userId) {
    - 如果用户已用邮箱注册，会自动绑定 Google 账号
    - 需要在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 配置 OAuth 2.0 凭据
 
+6. **邮件验证码**
+   - 验证码有效期默认 10 分钟（可配置）
+   - 同一邮箱每分钟只能发送 1 次验证码
+   - 找回密码时需要用户已注册
+
+### 找回密码示例代码
+
+```javascript
+// 发送重置密码验证码
+async function sendResetCode(systemCode, email) {
+  const response = await fetch('/auth/send-verification-code', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_code: systemCode,
+      email: email,
+      code_type: 'reset_password'
+    })
+  });
+  
+  if (response.status === 429) {
+    throw new Error('请求过于频繁，请稍后再试');
+  }
+  
+  if (response.status === 404) {
+    throw new Error('该邮箱尚未注册');
+  }
+  
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error || '发送验证码失败');
+  }
+  
+  return true;
+}
+
+// 重置密码
+async function resetPassword(systemCode, email, code, newPassword) {
+  const response = await fetch('/auth/reset-password', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      system_code: systemCode,
+      email: email,
+      code: code,
+      new_password: newPassword
+    })
+  });
+  
+  if (response.status === 400) {
+    throw new Error('验证码错误或已过期');
+  }
+  
+  if (!response.ok) {
+    const error = await response.json();
+    throw new Error(error.error || '重置密码失败');
+  }
+  
+  return true;
+}
+```
+
 ---
 
 ## 错误码速查
 
 | HTTP 状态码 | 错误场景 |
 |-------------|----------|
-| 400 | 参数缺失或格式错误 |
+| 400 | 参数缺失或格式错误、验证码无效/已过期 |
 | 403 | 无有效订阅或积分不足 |
 | 404 | 用户/订单/订阅不存在 |
 | 409 | 重复请求（如相同 request_id） |
-| 503 | Stripe 未配置，无法使用支付功能 |
+| 429 | 请求过于频繁（验证码1分钟内限发1次） |
+| 503 | Stripe/邮件服务未配置 |

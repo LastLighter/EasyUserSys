@@ -29,6 +29,9 @@ var (
 	ErrInvalidCredentials    = errors.New("invalid email or password")
 	ErrUnauthorized          = errors.New("unauthorized")
 	ErrForbidden             = errors.New("forbidden")
+	ErrInvalidCode           = errors.New("invalid or expired verification code")
+	ErrCodeAlreadyUsed       = errors.New("verification code already used")
+	ErrTooManyRequests       = errors.New("too many requests, please try again later")
 )
 
 type Service struct {
@@ -893,4 +896,150 @@ func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, systemCode, goo
 	}
 
 	return user, true, nil
+}
+
+// ========== 验证码相关方法 ==========
+
+// generateVerificationCode 生成6位数字验证码
+func generateVerificationCode() (string, error) {
+	buf := make([]byte, 3)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	// 生成6位数字验证码
+	code := fmt.Sprintf("%06d", (int(buf[0])<<16|int(buf[1])<<8|int(buf[2]))%1000000)
+	return code, nil
+}
+
+// CreateVerificationCode 创建验证码
+// 限制：每个邮箱每分钟最多发送1次
+func (s *Service) CreateVerificationCode(ctx context.Context, systemCode, email, codeType string) (string, error) {
+	if systemCode == "" || email == "" || codeType == "" {
+		return "", ErrInvalidRequest
+	}
+
+	// 验证 codeType
+	if codeType != models.CodeTypeSignup && codeType != models.CodeTypeResetPassword {
+		return "", ErrInvalidRequest
+	}
+
+	// 检查是否在1分钟内已发送过验证码（防止滥用）
+	var recentCount int
+	err := s.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM verification_codes 
+		WHERE system_code = $1 AND email = $2 AND code_type = $3 
+		AND created_at > NOW() - INTERVAL '1 minute'`,
+		systemCode, email, codeType,
+	).Scan(&recentCount)
+	if err != nil {
+		return "", err
+	}
+	if recentCount > 0 {
+		return "", ErrTooManyRequests
+	}
+
+	// 生成验证码
+	code, err := generateVerificationCode()
+	if err != nil {
+		return "", err
+	}
+
+	// 设置过期时间
+	expiresAt := time.Now().UTC().Add(s.config.VerificationCodeExpiry())
+
+	// 保存验证码
+	_, err = s.pool.Exec(ctx, `
+		INSERT INTO verification_codes (system_code, email, code, code_type, expires_at)
+		VALUES ($1, $2, $3, $4, $5)`,
+		systemCode, email, code, codeType, expiresAt,
+	)
+	if err != nil {
+		return "", err
+	}
+
+	return code, nil
+}
+
+// VerifyCode 验证验证码
+func (s *Service) VerifyCode(ctx context.Context, systemCode, email, code, codeType string) error {
+	if systemCode == "" || email == "" || code == "" || codeType == "" {
+		return ErrInvalidRequest
+	}
+
+	// 查找最新的未使用且未过期的验证码
+	var vc models.VerificationCode
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, system_code, email, code, code_type, expires_at, verified, created_at
+		FROM verification_codes
+		WHERE system_code = $1 AND email = $2 AND code_type = $3 AND verified = false
+		ORDER BY created_at DESC
+		LIMIT 1`,
+		systemCode, email, codeType,
+	).Scan(&vc.ID, &vc.SystemCode, &vc.Email, &vc.Code, &vc.CodeType, &vc.ExpiresAt, &vc.Verified, &vc.CreatedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrInvalidCode
+		}
+		return err
+	}
+
+	// 检查是否过期
+	if time.Now().UTC().After(vc.ExpiresAt) {
+		return ErrInvalidCode
+	}
+
+	// 检查验证码是否匹配
+	if vc.Code != code {
+		return ErrInvalidCode
+	}
+
+	// 标记验证码为已使用
+	_, err = s.pool.Exec(ctx, `
+		UPDATE verification_codes SET verified = true WHERE id = $1`, vc.ID)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+// ResetPassword 重置密码
+// 需要先调用 VerifyCode 验证验证码
+func (s *Service) ResetPassword(ctx context.Context, systemCode, email, newPassword string) error {
+	if systemCode == "" || email == "" || newPassword == "" {
+		return ErrInvalidRequest
+	}
+
+	// 验证用户存在
+	user, err := s.GetUserByEmail(ctx, systemCode, email)
+	if err != nil {
+		return err
+	}
+
+	// 生成新密码的哈希
+	passwordHash, err := bcrypt.GenerateFromPassword([]byte(newPassword), bcrypt.DefaultCost)
+	if err != nil {
+		return err
+	}
+
+	// 更新密码
+	ct, err := s.pool.Exec(ctx, `
+		UPDATE users SET password_hash = $1, updated_at = NOW()
+		WHERE id = $2`, string(passwordHash), user.ID)
+	if err != nil {
+		return err
+	}
+	if ct.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+
+	return nil
+}
+
+// CleanupExpiredCodes 清理过期的验证码
+func (s *Service) CleanupExpiredCodes(ctx context.Context) error {
+	_, err := s.pool.Exec(ctx, `
+		DELETE FROM verification_codes 
+		WHERE expires_at < NOW() - INTERVAL '1 day'`)
+	return err
 }

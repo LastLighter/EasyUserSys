@@ -129,3 +129,20 @@ const (
 	OrderStatusPaid    = "paid"
 	OrderStatusFailed  = "failed"
 )
+
+// VerificationCode 验证码模型
+type VerificationCode struct {
+	ID         int64
+	SystemCode string
+	Email      string
+	Code       string
+	CodeType   string // signup | reset_password
+	ExpiresAt  time.Time
+	Verified   bool
+	CreatedAt  time.Time
+}
+
+const (
+	CodeTypeSignup        = "signup"
+	CodeTypeResetPassword = "reset_password"
+)

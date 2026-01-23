@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"easyusersys/internal/config"
+	"easyusersys/internal/email"
 	"easyusersys/internal/models"
 	"easyusersys/internal/services"
 
@@ -21,12 +22,14 @@ import (
 )
 
 type Server struct {
-	svc *services.Service
-	cfg config.Config
+	svc         *services.Service
+	cfg         config.Config
+	emailClient *email.ResendClient
 }
 
 func NewServer(svc *services.Service, cfg config.Config) *Server {
-	return &Server{svc: svc, cfg: cfg}
+	emailClient := email.NewResendClient(cfg.ResendAPIKey)
+	return &Server{svc: svc, cfg: cfg, emailClient: emailClient}
 }
 
 func (s *Server) Routes() http.Handler {
@@ -40,6 +43,9 @@ func (s *Server) Routes() http.Handler {
 	r.Post("/auth/login", s.handleLogin)
 	r.Get("/auth/google", s.handleGoogleLogin)
 	r.Get("/auth/google/callback", s.handleGoogleCallback)
+	r.Post("/auth/send-verification-code", s.handleSendVerificationCode)
+	r.Post("/auth/verify-code", s.handleVerifyCode)
+	r.Post("/auth/reset-password", s.handleResetPassword)
 	r.Post("/users", s.handleCreateUser)
 	r.Get("/users/by-email", s.handleGetUserByEmail)
 	r.Get("/plans", s.handleListPlans)
@@ -726,6 +732,12 @@ func (s *Server) respondServiceError(w http.ResponseWriter, err error) {
 		respondError(w, http.StatusForbidden, err)
 	case errors.Is(err, services.ErrStripeNotConfigured):
 		respondError(w, http.StatusServiceUnavailable, err)
+	case errors.Is(err, services.ErrInvalidCode):
+		respondError(w, http.StatusBadRequest, err)
+	case errors.Is(err, services.ErrCodeAlreadyUsed):
+		respondError(w, http.StatusBadRequest, err)
+	case errors.Is(err, services.ErrTooManyRequests):
+		respondError(w, http.StatusTooManyRequests, err)
 	default:
 		respondError(w, http.StatusInternalServerError, err)
 	}
@@ -894,4 +906,139 @@ func (s *Server) handleAdminGetStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, stats)
+}
+
+// ========== 验证码相关 Handlers ==========
+
+type sendVerificationCodeRequest struct {
+	SystemCode string `json:"system_code"`
+	Email      string `json:"email"`
+	CodeType   string `json:"code_type"` // signup | reset_password
+}
+
+func (s *Server) handleSendVerificationCode(w http.ResponseWriter, r *http.Request) {
+	// 检查邮件服务 API Key 是否配置
+	if !s.emailClient.IsConfigured() {
+		respondError(w, http.StatusServiceUnavailable, email.ErrEmailNotConfigured)
+		return
+	}
+
+	var req sendVerificationCodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.SystemCode == "" || req.Email == "" || req.CodeType == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code, email and code_type are required"))
+		return
+	}
+
+	// 获取该 system_code 对应的邮件发送配置
+	emailConfig, ok := s.cfg.ResendEmailFor(req.SystemCode)
+	if !ok || emailConfig.FromEmail == "" {
+		respondError(w, http.StatusServiceUnavailable, errors.New("email service not configured for this system"))
+		return
+	}
+
+	// 验证 code_type
+	if req.CodeType != models.CodeTypeSignup && req.CodeType != models.CodeTypeResetPassword {
+		respondError(w, http.StatusBadRequest, errors.New("invalid code_type, must be 'signup' or 'reset_password'"))
+		return
+	}
+
+	// 如果是重置密码，需要验证用户存在
+	if req.CodeType == models.CodeTypeResetPassword {
+		_, err := s.svc.GetUserByEmail(r.Context(), req.SystemCode, req.Email)
+		if err != nil {
+			if errors.Is(err, services.ErrNotFound) {
+				respondError(w, http.StatusNotFound, errors.New("user not found"))
+				return
+			}
+			s.respondServiceError(w, err)
+			return
+		}
+	}
+
+	// 创建验证码
+	code, err := s.svc.CreateVerificationCode(r.Context(), req.SystemCode, req.Email, req.CodeType)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	// 发送邮件（使用该 system_code 对应的发件人地址）
+	if err := s.emailClient.SendVerificationCode(emailConfig.FromEmail, req.Email, code, req.CodeType); err != nil {
+		respondError(w, http.StatusInternalServerError, errors.New("failed to send verification email"))
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "verification code sent",
+	})
+}
+
+type verifyCodeRequest struct {
+	SystemCode string `json:"system_code"`
+	Email      string `json:"email"`
+	Code       string `json:"code"`
+	CodeType   string `json:"code_type"`
+}
+
+func (s *Server) handleVerifyCode(w http.ResponseWriter, r *http.Request) {
+	var req verifyCodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.SystemCode == "" || req.Email == "" || req.Code == "" || req.CodeType == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code, email, code and code_type are required"))
+		return
+	}
+
+	if err := s.svc.VerifyCode(r.Context(), req.SystemCode, req.Email, req.Code, req.CodeType); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "code verified",
+	})
+}
+
+type resetPasswordRequest struct {
+	SystemCode  string `json:"system_code"`
+	Email       string `json:"email"`
+	Code        string `json:"code"`
+	NewPassword string `json:"new_password"`
+}
+
+func (s *Server) handleResetPassword(w http.ResponseWriter, r *http.Request) {
+	var req resetPasswordRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	if req.SystemCode == "" || req.Email == "" || req.Code == "" || req.NewPassword == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code, email, code and new_password are required"))
+		return
+	}
+
+	// 验证验证码
+	if err := s.svc.VerifyCode(r.Context(), req.SystemCode, req.Email, req.Code, models.CodeTypeResetPassword); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	// 重置密码
+	if err := s.svc.ResetPassword(r.Context(), req.SystemCode, req.Email, req.NewPassword); err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, map[string]string{
+		"status":  "ok",
+		"message": "password reset successfully",
+	})
 }

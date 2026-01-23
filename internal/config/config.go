@@ -29,12 +29,21 @@ type Config struct {
 	GoogleClientID     string
 	GoogleClientSecret string
 	GoogleRedirectURL  string
+	// Resend 邮件服务配置（API Key 和过期时间共享，发件人支持多应用）
+	ResendAPIKey                  string
+	ResendFromEmail               string // 兼容旧配置（单应用）
+	ResendEmailConfigs            map[string]ResendEmailConfig // 多应用配置
+	VerificationCodeExpiryMinutes int
 }
 
 type GoogleOAuthConfig struct {
 	ClientID     string `json:"client_id"`
 	ClientSecret string `json:"client_secret"`
 	RedirectURL  string `json:"redirect_url"`
+}
+
+type ResendEmailConfig struct {
+	FromEmail string `json:"from_email"`
 }
 
 func Load() Config {
@@ -49,6 +58,16 @@ func Load() Config {
 			"default": legacyGoogle,
 		}
 	}
+
+	// 解析多应用邮件配置
+	resendEmailConfigs := parseResendEmailConfigs(env("RESEND_EMAIL_CONFIGS", ""))
+	legacyFromEmail := env("RESEND_FROM_EMAIL", "")
+	if len(resendEmailConfigs) == 0 && legacyFromEmail != "" {
+		resendEmailConfigs = map[string]ResendEmailConfig{
+			"default": {FromEmail: legacyFromEmail},
+		}
+	}
+
 	return Config{
 		DatabaseURL:                 env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/easyusersys?sslmode=disable"),
 		ServerAddr:                  env("SERVER_ADDR", ":8080"),
@@ -69,6 +88,10 @@ func Load() Config {
 		GoogleClientID:              legacyGoogle.ClientID,
 		GoogleClientSecret:          legacyGoogle.ClientSecret,
 		GoogleRedirectURL:           legacyGoogle.RedirectURL,
+		ResendAPIKey:                  env("RESEND_API_KEY", ""),
+		ResendFromEmail:               legacyFromEmail,
+		ResendEmailConfigs:            resendEmailConfigs,
+		VerificationCodeExpiryMinutes: envInt("VERIFICATION_CODE_EXPIRY_MINUTES", 10),
 	}
 }
 
@@ -99,8 +122,23 @@ func parseGoogleOAuthConfigs(raw string) map[string]GoogleOAuthConfig {
 	return parsed
 }
 
+func parseResendEmailConfigs(raw string) map[string]ResendEmailConfig {
+	if raw == "" {
+		return nil
+	}
+	var parsed map[string]ResendEmailConfig
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return nil
+	}
+	return parsed
+}
+
 func (c Config) PrepaidExpiry() time.Duration {
 	return time.Duration(c.PrepaidExpiryDays) * 24 * time.Hour
+}
+
+func (c Config) VerificationCodeExpiry() time.Duration {
+	return time.Duration(c.VerificationCodeExpiryMinutes) * time.Minute
 }
 
 func (c Config) GoogleOAuthFor(systemCode string) (GoogleOAuthConfig, bool) {
@@ -113,4 +151,16 @@ func (c Config) GoogleOAuthFor(systemCode string) (GoogleOAuthConfig, bool) {
 		return cfg, true
 	}
 	return GoogleOAuthConfig{}, false
+}
+
+func (c Config) ResendEmailFor(systemCode string) (ResendEmailConfig, bool) {
+	if systemCode != "" {
+		if cfg, ok := c.ResendEmailConfigs[systemCode]; ok {
+			return cfg, true
+		}
+	}
+	if cfg, ok := c.ResendEmailConfigs["default"]; ok {
+		return cfg, true
+	}
+	return ResendEmailConfig{}, false
 }
