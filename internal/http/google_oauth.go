@@ -23,17 +23,21 @@ type GoogleUserInfo struct {
 }
 
 // getGoogleOAuthConfig 获取 Google OAuth 配置
-func (s *Server) getGoogleOAuthConfig() *oauth2.Config {
+func (s *Server) getGoogleOAuthConfig(systemCode string) (*oauth2.Config, error) {
+	googleCfg, ok := s.cfg.GoogleOAuthFor(systemCode)
+	if !ok || googleCfg.ClientID == "" || googleCfg.ClientSecret == "" || googleCfg.RedirectURL == "" {
+		return nil, errors.New("Google OAuth not configured")
+	}
 	return &oauth2.Config{
-		ClientID:     s.cfg.GoogleClientID,
-		ClientSecret: s.cfg.GoogleClientSecret,
-		RedirectURL:  s.cfg.GoogleRedirectURL,
+		ClientID:     googleCfg.ClientID,
+		ClientSecret: googleCfg.ClientSecret,
+		RedirectURL:  googleCfg.RedirectURL,
 		Scopes: []string{
 			"https://www.googleapis.com/auth/userinfo.email",
 			"https://www.googleapis.com/auth/userinfo.profile",
 		},
 		Endpoint: google.Endpoint,
-	}
+	}, nil
 }
 
 // generateStateToken 生成随机状态令牌用于防止 CSRF 攻击
@@ -48,8 +52,14 @@ func generateStateToken() (string, error) {
 // handleGoogleLogin 处理 Google OAuth 登录请求
 // 重定向用户到 Google 授权页面
 func (s *Server) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.GoogleClientID == "" || s.cfg.GoogleClientSecret == "" {
-		respondError(w, http.StatusServiceUnavailable, errors.New("Google OAuth not configured"))
+	systemCode := r.URL.Query().Get("system_code")
+	if systemCode == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code is required"))
+		return
+	}
+	config, err := s.getGoogleOAuthConfig(systemCode)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err)
 		return
 	}
 
@@ -69,19 +79,23 @@ func (s *Server) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
 	})
+	// 存储 system_code，用于回调时确定租户
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oauth_system_code",
+		Value:    systemCode,
+		Path:     "/",
+		MaxAge:   int(10 * time.Minute / time.Second),
+		HttpOnly: true,
+		Secure:   r.TLS != nil,
+		SameSite: http.SameSiteLaxMode,
+	})
 
-	config := s.getGoogleOAuthConfig()
 	url := config.AuthCodeURL(state, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
 // handleGoogleCallback 处理 Google OAuth 回调
 func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.GoogleClientID == "" || s.cfg.GoogleClientSecret == "" {
-		respondError(w, http.StatusServiceUnavailable, errors.New("Google OAuth not configured"))
-		return
-	}
-
 	// 验证 state 参数以防止 CSRF 攻击
 	state := r.URL.Query().Get("state")
 	cookie, err := r.Cookie("oauth_state")
@@ -89,10 +103,29 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, errors.New("invalid state parameter"))
 		return
 	}
+	systemCookie, err := r.Cookie("oauth_system_code")
+	if err != nil || systemCookie.Value == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code missing"))
+		return
+	}
+	systemCode := systemCookie.Value
+	config, err := s.getGoogleOAuthConfig(systemCode)
+	if err != nil {
+		respondError(w, http.StatusServiceUnavailable, err)
+		return
+	}
 
 	// 清除 state cookie
 	http.SetCookie(w, &http.Cookie{
 		Name:     "oauth_state",
+		Value:    "",
+		Path:     "/",
+		MaxAge:   -1,
+		HttpOnly: true,
+	})
+	// 清除 system_code cookie
+	http.SetCookie(w, &http.Cookie{
+		Name:     "oauth_system_code",
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
@@ -113,7 +146,6 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 交换授权码获取访问令牌
-	config := s.getGoogleOAuthConfig()
 	token, err := config.Exchange(context.Background(), code)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, errors.New("failed to exchange token: "+err.Error()))
@@ -121,7 +153,7 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取用户信息
-	userInfo, err := s.getGoogleUserInfo(token)
+	userInfo, err := s.getGoogleUserInfo(config, token)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
@@ -134,7 +166,7 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 获取或创建用户
-	user, isNewUser, err := s.svc.GetOrCreateUserByGoogleID(r.Context(), userInfo.ID, userInfo.Email)
+	user, isNewUser, err := s.svc.GetOrCreateUserByGoogleID(r.Context(), systemCode, userInfo.ID, userInfo.Email)
 	if err != nil {
 		s.respondServiceError(w, err)
 		return
@@ -157,16 +189,16 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 		"token":       jwtToken,
 		"is_new_user": isNewUser,
 		"user": map[string]any{
-			"id":    user.ID,
-			"email": user.Email,
-			"role":  user.Role,
+			"id":          user.ID,
+			"system_code": user.SystemCode,
+			"email":       user.Email,
+			"role":        user.Role,
 		},
 	})
 }
 
 // getGoogleUserInfo 使用访问令牌获取 Google 用户信息
-func (s *Server) getGoogleUserInfo(token *oauth2.Token) (*GoogleUserInfo, error) {
-	config := s.getGoogleOAuthConfig()
+func (s *Server) getGoogleUserInfo(config *oauth2.Config, token *oauth2.Token) (*GoogleUserInfo, error) {
 	client := config.Client(context.Background(), token)
 
 	resp, err := client.Get("https://www.googleapis.com/oauth2/v2/userinfo")

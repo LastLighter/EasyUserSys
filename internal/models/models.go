@@ -4,6 +4,7 @@ import "time"
 
 type User struct {
 	ID           int64
+	SystemCode   string
 	Email        string
 	PasswordHash string  `json:"-"`
 	GoogleID     *string `json:"-"` // Google OAuth 用户ID

@@ -74,6 +74,7 @@ Authorization: Bearer <your_jwt_token>
 **请求**：
 ```json
 {
+  "system_code": "demo",
   "email": "user@example.com",
   "password": "your_password"
 }
@@ -81,6 +82,7 @@ Authorization: Bearer <your_jwt_token>
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
+| system_code | string | 是 | 系统标识（租户） |
 | email | string | 是 | 用户邮箱 |
 | password | string | 是 | 用户密码 |
 
@@ -90,6 +92,7 @@ Authorization: Bearer <your_jwt_token>
   "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
   "user": {
     "id": 1,
+    "system_code": "demo",
     "email": "user@example.com",
     "role": "user"
   }
@@ -117,8 +120,13 @@ Authorization: Bearer <your_jwt_token>
 **使用方式**：
 ```javascript
 // 前端直接跳转
-window.location.href = '/auth/google';
+window.location.href = '/auth/google?system_code=demo';
 ```
+**查询参数**：
+| 参数 | 类型 | 必填 | 说明 |
+|------|------|------|------|
+| system_code | string | 是 | 系统标识（租户） |
+
 
 **流程说明**：
 1. 用户访问此接口
@@ -152,6 +160,7 @@ window.location.href = '/auth/google';
   "is_new_user": true,
   "user": {
     "id": 1,
+    "system_code": "demo",
     "email": "user@gmail.com",
     "role": "user"
   }
@@ -192,6 +201,7 @@ window.location.href = '/auth/google';
 **请求**：
 ```json
 {
+  "system_code": "demo",
   "email": "user@example.com",
   "password": "your_secure_password"
 }
@@ -199,13 +209,15 @@ window.location.href = '/auth/google';
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
-| email | string | 是 | 用户邮箱，需唯一 |
+| system_code | string | 是 | 系统标识（租户） |
+| email | string | 是 | 用户邮箱，系统内需唯一 |
 | password | string | 是 | 用户密码 |
 
 **响应**（201）：
 ```json
 {
   "ID": 1,
+  "SystemCode": "demo",
   "Email": "user@example.com",
   "Status": "active",
   "Role": "user",
@@ -229,6 +241,7 @@ window.location.href = '/auth/google';
 ```json
 {
   "ID": 1,
+  "SystemCode": "demo",
   "Email": "user@example.com",
   "Status": "active",
   "Role": "user",
@@ -241,11 +254,12 @@ window.location.href = '/auth/google';
 
 ### 通过邮箱查询用户
 
-`GET /users/by-email?email={email}` **公开**
+`GET /users/by-email?system_code={system_code}&email={email}` **公开**
 
 **查询参数**：
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
+| system_code | string | 是 | 系统标识（租户） |
 | email | string | 是 | 用户邮箱 |
 
 **响应**（200）：与「查询用户」相同
@@ -709,6 +723,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
   "users": [
     {
       "ID": 1,
+      "SystemCode": "demo",
       "Email": "user@example.com",
       "Status": "active",
       "Role": "user",
@@ -908,11 +923,11 @@ function getAuthHeaders() {
 }
 
 // 0a. 邮箱密码登录
-async function login(email, password) {
+async function login(systemCode, email, password) {
   const response = await fetch('/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ email, password })
+    body: JSON.stringify({ system_code: systemCode, email, password })
   });
   
   if (!response.ok) {
@@ -927,7 +942,7 @@ async function login(email, password) {
 // 0b. Google OAuth 登录
 function loginWithGoogle() {
   // 直接跳转到 Google 授权页面
-  window.location.href = '/auth/google';
+  window.location.href = '/auth/google?system_code=demo';
 }
 
 // 0c. Google 登录回调处理（在回调页面调用）

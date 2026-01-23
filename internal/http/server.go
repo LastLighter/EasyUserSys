@@ -100,8 +100,9 @@ func (s *Server) corsMiddleware(next http.Handler) http.Handler {
 }
 
 type loginRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	SystemCode string `json:"system_code"`
+	Email      string `json:"email"`
+	Password   string `json:"password"`
 }
 
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
@@ -110,12 +111,12 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Email == "" || req.Password == "" {
-		respondError(w, http.StatusBadRequest, errors.New("email and password are required"))
+	if req.SystemCode == "" || req.Email == "" || req.Password == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code, email and password are required"))
 		return
 	}
 
-	user, err := s.svc.AuthenticateUser(r.Context(), req.Email, req.Password)
+	user, err := s.svc.AuthenticateUser(r.Context(), req.SystemCode, req.Email, req.Password)
 	if err != nil {
 		if errors.Is(err, services.ErrInvalidCredentials) {
 			respondError(w, http.StatusUnauthorized, err)
@@ -134,16 +135,18 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	respondJSON(w, http.StatusOK, map[string]any{
 		"token": token,
 		"user": map[string]any{
-			"id":    user.ID,
-			"email": user.Email,
-			"role":  user.Role,
+			"id":          user.ID,
+			"system_code": user.SystemCode,
+			"email":       user.Email,
+			"role":        user.Role,
 		},
 	})
 }
 
 type createUserRequest struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
+	SystemCode string `json:"system_code"`
+	Email      string `json:"email"`
+	Password   string `json:"password"`
 }
 
 func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
@@ -152,11 +155,11 @@ func (s *Server) handleCreateUser(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-	if req.Email == "" || req.Password == "" {
-		respondError(w, http.StatusBadRequest, errors.New("email and password are required"))
+	if req.SystemCode == "" || req.Email == "" || req.Password == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code, email and password are required"))
 		return
 	}
-	user, err := s.svc.CreateUser(r.Context(), req.Email, req.Password)
+	user, err := s.svc.CreateUser(r.Context(), req.SystemCode, req.Email, req.Password)
 	if err != nil {
 		s.respondServiceError(w, err)
 		return
@@ -184,12 +187,13 @@ func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleGetUserByEmail(w http.ResponseWriter, r *http.Request) {
+	systemCode := r.URL.Query().Get("system_code")
 	email := r.URL.Query().Get("email")
-	if email == "" {
-		respondError(w, http.StatusBadRequest, errors.New("email is required"))
+	if systemCode == "" || email == "" {
+		respondError(w, http.StatusBadRequest, errors.New("system_code and email are required"))
 		return
 	}
-	user, err := s.svc.GetUserByEmail(r.Context(), email)
+	user, err := s.svc.GetUserByEmail(r.Context(), systemCode, email)
 	if err != nil {
 		s.respondServiceError(w, err)
 		return

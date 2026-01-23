@@ -54,8 +54,8 @@ func (s *Service) EnsureDefaultPlans(ctx context.Context) error {
 	return err
 }
 
-func (s *Service) CreateUser(ctx context.Context, email, password string) (models.User, error) {
-	if email == "" || password == "" {
+func (s *Service) CreateUser(ctx context.Context, systemCode, email, password string) (models.User, error) {
+	if systemCode == "" || email == "" || password == "" {
 		return models.User{}, ErrInvalidRequest
 	}
 	passwordHash, err := bcrypt.GenerateFromPassword([]byte(password), bcrypt.DefaultCost)
@@ -64,11 +64,11 @@ func (s *Service) CreateUser(ctx context.Context, email, password string) (model
 	}
 	var user models.User
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO users (email, password_hash, status, role)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, email, password_hash, google_id, status, role, created_at, updated_at`,
-		email, string(passwordHash), models.UserStatusActive, models.UserRoleUser,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
+		INSERT INTO users (system_code, email, password_hash, status, role)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, system_code, email, password_hash, google_id, status, role, created_at, updated_at`,
+		systemCode, email, string(passwordHash), models.UserStatusActive, models.UserRoleUser,
+	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
 		return models.User{}, err
 	}
@@ -93,21 +93,21 @@ func (s *Service) CreateUser(ctx context.Context, email, password string) (model
 func (s *Service) GetUserByID(ctx context.Context, id int64) (models.User, error) {
 	var user models.User
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, google_id, status, role, created_at, updated_at
+		SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
 		FROM users WHERE id = $1`, id,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
+	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return models.User{}, ErrNotFound
 	}
 	return user, err
 }
 
-func (s *Service) GetUserByEmail(ctx context.Context, email string) (models.User, error) {
+func (s *Service) GetUserByEmail(ctx context.Context, systemCode, email string) (models.User, error) {
 	var user models.User
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, google_id, status, role, created_at, updated_at
-		FROM users WHERE email = $1`, email,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
+		SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
+		FROM users WHERE system_code = $1 AND email = $2`, systemCode, email,
+	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return models.User{}, ErrNotFound
 	}
@@ -653,12 +653,12 @@ func (s *Service) StringifyPoints(points int) string {
 }
 
 // AuthenticateUser 验证用户凭证
-func (s *Service) AuthenticateUser(ctx context.Context, email, password string) (models.User, error) {
-	if email == "" || password == "" {
+func (s *Service) AuthenticateUser(ctx context.Context, systemCode, email, password string) (models.User, error) {
+	if systemCode == "" || email == "" || password == "" {
 		return models.User{}, ErrInvalidCredentials
 	}
 
-	user, err := s.GetUserByEmail(ctx, email)
+	user, err := s.GetUserByEmail(ctx, systemCode, email)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return models.User{}, ErrInvalidCredentials
@@ -694,7 +694,7 @@ func (s *Service) ListUsers(ctx context.Context, page, pageSize int) ([]models.U
 	}
 
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, email, password_hash, google_id, status, role, created_at, updated_at
+		SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
 		FROM users
 		ORDER BY id DESC
 		LIMIT $1 OFFSET $2`, pageSize, offset)
@@ -706,7 +706,7 @@ func (s *Service) ListUsers(ctx context.Context, page, pageSize int) ([]models.U
 	var users []models.User
 	for rows.Next() {
 		var u models.User
-		if err := rows.Scan(&u.ID, &u.Email, &u.PasswordHash, &u.GoogleID, &u.Status, &u.Role, &u.CreatedAt, &u.UpdatedAt); err != nil {
+		if err := rows.Scan(&u.ID, &u.SystemCode, &u.Email, &u.PasswordHash, &u.GoogleID, &u.Status, &u.Role, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		users = append(users, u)
@@ -825,17 +825,17 @@ func (s *Service) GetAPIKeyByID(ctx context.Context, id int64) (models.APIKey, e
 
 // GetOrCreateUserByGoogleID 通过 Google ID 获取或创建用户
 // 首次登录时会自动创建用户并赠送免费积分
-func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, googleID, email string) (models.User, bool, error) {
-	if googleID == "" || email == "" {
+func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, systemCode, googleID, email string) (models.User, bool, error) {
+	if systemCode == "" || googleID == "" || email == "" {
 		return models.User{}, false, ErrInvalidRequest
 	}
 
 	// 先尝试通过 google_id 查找用户
 	var user models.User
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, email, password_hash, google_id, status, role, created_at, updated_at
-		FROM users WHERE google_id = $1`, googleID,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
+		SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
+		FROM users WHERE system_code = $1 AND google_id = $2`, systemCode, googleID,
+	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 
 	if err == nil {
 		// 用户已存在
@@ -847,7 +847,7 @@ func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, googleID, email
 	}
 
 	// 检查是否有相同邮箱的用户（可能是之前用密码注册的）
-	existingUser, err := s.GetUserByEmail(ctx, email)
+	existingUser, err := s.GetUserByEmail(ctx, systemCode, email)
 	if err == nil {
 		// 用户存在但没有绑定 Google ID，更新绑定
 		_, err = s.pool.Exec(ctx, `
@@ -866,11 +866,11 @@ func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, googleID, email
 
 	// 用户不存在，创建新用户
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO users (email, google_id, status, role)
-		VALUES ($1, $2, $3, $4)
-		RETURNING id, email, password_hash, google_id, status, role, created_at, updated_at`,
-		email, googleID, models.UserStatusActive, models.UserRoleUser,
-	).Scan(&user.ID, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
+		INSERT INTO users (system_code, email, google_id, status, role)
+		VALUES ($1, $2, $3, $4, $5)
+		RETURNING id, system_code, email, password_hash, google_id, status, role, created_at, updated_at`,
+		systemCode, email, googleID, models.UserStatusActive, models.UserRoleUser,
+	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
 		return models.User{}, false, err
 	}
