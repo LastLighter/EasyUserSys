@@ -85,7 +85,15 @@ func (s *Server) Routes() http.Handler {
 		r.Patch("/users/{id}/role", s.handleAdminUpdateUserRole)
 		r.Get("/users/{id}/usage", s.handleAdminGetUserUsage)
 		r.Get("/users/{id}/subscriptions", s.handleAdminGetUserSubscriptions)
+		r.Get("/users/{id}/balances", s.handleAdminGetUserBalances)
 		r.Get("/stats", s.handleAdminGetStats)
+	})
+
+	// 内部服务接口（使用 X-API-Key 验证）
+	r.Route("/internal", func(r chi.Router) {
+		r.Use(s.internalAPIKeyMiddleware)
+
+		r.Get("/users/{id}/balances", s.handleInternalGetUserBalances)
 	})
 
 	return r
@@ -809,8 +817,17 @@ func parsePagination(r *http.Request) (int, int) {
 
 func (s *Server) handleAdminListUsers(w http.ResponseWriter, r *http.Request) {
 	page, pageSize := parsePagination(r)
+	systemCode := r.URL.Query().Get("system_code")
+	includeBalances := r.URL.Query().Get("include_balances") == "true"
 
-	users, total, err := s.svc.ListUsers(r.Context(), page, pageSize)
+	opts := services.ListUsersOptions{
+		Page:            page,
+		PageSize:        pageSize,
+		SystemCode:      systemCode,
+		IncludeBalances: includeBalances,
+	}
+
+	users, total, err := s.svc.ListUsersWithOptions(r.Context(), opts)
 	if err != nil {
 		s.respondServiceError(w, err)
 		return
@@ -906,6 +923,60 @@ func (s *Server) handleAdminGetStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	respondJSON(w, http.StatusOK, stats)
+}
+
+func (s *Server) handleAdminGetUserBalances(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	balances, err := s.svc.ListBalances(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, balances)
+}
+
+// ========== 内部服务接口 Handlers ==========
+
+// internalAPIKeyMiddleware 内部服务 API Key 验证中间件
+func (s *Server) internalAPIKeyMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.cfg.UsageAPIKey == "" {
+			respondError(w, http.StatusServiceUnavailable, errors.New("internal API key not configured"))
+			return
+		}
+		apiKey := r.Header.Get("X-API-Key")
+		if apiKey == "" {
+			respondError(w, http.StatusUnauthorized, errors.New("missing X-API-Key header"))
+			return
+		}
+		if apiKey != s.cfg.UsageAPIKey {
+			respondError(w, http.StatusUnauthorized, errors.New("invalid API key"))
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (s *Server) handleInternalGetUserBalances(w http.ResponseWriter, r *http.Request) {
+	userID, err := parseID(chi.URLParam(r, "id"))
+	if err != nil {
+		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+
+	balances, err := s.svc.ListBalances(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+
+	respondJSON(w, http.StatusOK, balances)
 }
 
 // ========== 验证码相关 Handlers ==========

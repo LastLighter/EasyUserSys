@@ -680,41 +680,134 @@ func (s *Service) AuthenticateUser(ctx context.Context, systemCode, email, passw
 	return user, nil
 }
 
+// ListUsersOptions 列出用户的选项
+type ListUsersOptions struct {
+	Page            int
+	PageSize        int
+	SystemCode      string // 可选，按 system_code 筛选
+	IncludeBalances bool   // 是否包含余额信息
+}
+
+// UserWithBalance 包含余额信息的用户
+type UserWithBalance struct {
+	models.User
+	TotalBalance     int `json:"total_balance"`               // 总剩余积分
+	BalanceBuckets   []models.BalanceBucket `json:"balance_buckets,omitempty"` // 详细的积分桶信息
+}
+
 // ListUsers 分页列出所有用户（管理员功能）
 func (s *Service) ListUsers(ctx context.Context, page, pageSize int) ([]models.User, int64, error) {
-	if page < 1 {
-		page = 1
-	}
-	if pageSize < 1 || pageSize > 100 {
-		pageSize = 20
-	}
-	offset := (page - 1) * pageSize
-
-	var total int64
-	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&total)
+	opts := ListUsersOptions{Page: page, PageSize: pageSize}
+	users, total, err := s.ListUsersWithOptions(ctx, opts)
 	if err != nil {
 		return nil, 0, err
 	}
+	// 转换为 []models.User
+	result := make([]models.User, len(users))
+	for i, u := range users {
+		result[i] = u.User
+	}
+	return result, total, nil
+}
 
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
-		FROM users
-		ORDER BY id DESC
-		LIMIT $1 OFFSET $2`, pageSize, offset)
+// ListUsersWithOptions 分页列出用户（支持筛选和包含余额）
+func (s *Service) ListUsersWithOptions(ctx context.Context, opts ListUsersOptions) ([]UserWithBalance, int64, error) {
+	if opts.Page < 1 {
+		opts.Page = 1
+	}
+	if opts.PageSize < 1 || opts.PageSize > 100 {
+		opts.PageSize = 20
+	}
+	offset := (opts.Page - 1) * opts.PageSize
+
+	// 构建查询条件
+	var total int64
+	var countQuery, selectQuery string
+	var args []any
+
+	if opts.SystemCode != "" {
+		countQuery = `SELECT COUNT(*) FROM users WHERE system_code = $1`
+		selectQuery = `
+			SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
+			FROM users
+			WHERE system_code = $1
+			ORDER BY id DESC
+			LIMIT $2 OFFSET $3`
+		args = []any{opts.SystemCode, opts.PageSize, offset}
+		err := s.pool.QueryRow(ctx, countQuery, opts.SystemCode).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+	} else {
+		countQuery = `SELECT COUNT(*) FROM users`
+		selectQuery = `
+			SELECT id, system_code, email, password_hash, google_id, status, role, created_at, updated_at
+			FROM users
+			ORDER BY id DESC
+			LIMIT $1 OFFSET $2`
+		args = []any{opts.PageSize, offset}
+		err := s.pool.QueryRow(ctx, countQuery).Scan(&total)
+		if err != nil {
+			return nil, 0, err
+		}
+	}
+
+	rows, err := s.pool.Query(ctx, selectQuery, args...)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer rows.Close()
 
-	var users []models.User
+	var users []UserWithBalance
 	for rows.Next() {
-		var u models.User
+		var u UserWithBalance
 		if err := rows.Scan(&u.ID, &u.SystemCode, &u.Email, &u.PasswordHash, &u.GoogleID, &u.Status, &u.Role, &u.CreatedAt, &u.UpdatedAt); err != nil {
 			return nil, 0, err
 		}
 		users = append(users, u)
 	}
-	return users, total, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, err
+	}
+
+	// 如果需要包含余额信息
+	if opts.IncludeBalances && len(users) > 0 {
+		// 收集所有用户 ID
+		userIDs := make([]int64, len(users))
+		userMap := make(map[int64]*UserWithBalance)
+		for i := range users {
+			userIDs[i] = users[i].ID
+			userMap[users[i].ID] = &users[i]
+		}
+
+		// 批量查询余额
+		balanceRows, err := s.pool.Query(ctx, `
+			SELECT id, user_id, bucket_type, total_points, remaining_points, expires_at, created_at, updated_at
+			FROM balance_buckets
+			WHERE user_id = ANY($1)
+			AND (expires_at IS NULL OR expires_at > NOW())
+			ORDER BY user_id, bucket_type, created_at DESC`, userIDs)
+		if err != nil {
+			return nil, 0, err
+		}
+		defer balanceRows.Close()
+
+		for balanceRows.Next() {
+			var b models.BalanceBucket
+			if err := balanceRows.Scan(&b.ID, &b.UserID, &b.BucketType, &b.TotalPoints, &b.RemainingPoints, &b.ExpiresAt, &b.CreatedAt, &b.UpdatedAt); err != nil {
+				return nil, 0, err
+			}
+			if user, ok := userMap[b.UserID]; ok {
+				user.BalanceBuckets = append(user.BalanceBuckets, b)
+				user.TotalBalance += b.RemainingPoints
+			}
+		}
+		if err := balanceRows.Err(); err != nil {
+			return nil, 0, err
+		}
+	}
+
+	return users, total, nil
 }
 
 // GetUserSubscriptions 获取用户的所有订阅记录

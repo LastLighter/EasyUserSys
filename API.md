@@ -866,15 +866,19 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 `GET /admin/users` **仅限管理员**
 
-分页列出所有用户。
+分页列出所有用户，支持按系统标识筛选，并可同时查询用户积分余额。
 
 **查询参数**：
 | 参数 | 类型 | 必填 | 说明 |
 |------|------|------|------|
 | page | int | 否 | 页码，默认 1 |
 | page_size | int | 否 | 每页数量，默认 20，最大 100 |
+| system_code | string | 否 | 按系统标识（租户）筛选 |
+| include_balances | bool | 否 | 是否包含积分余额信息，设为 `true` 时返回余额详情 |
 
 **响应**（200）：
+
+基础响应（不含余额）：
 ```json
 {
   "users": [
@@ -885,13 +889,75 @@ API Key 用于标识和验证应用程序的 API 调用身份。
       "Status": "active",
       "Role": "user",
       "CreatedAt": "2025-01-21T10:00:00Z",
-      "UpdatedAt": "2025-01-21T10:00:00Z"
+      "UpdatedAt": "2025-01-21T10:00:00Z",
+      "total_balance": 0
     }
   ],
   "total": 150,
   "page": 1,
   "page_size": 20
 }
+```
+
+包含余额的响应（`include_balances=true`）：
+```json
+{
+  "users": [
+    {
+      "ID": 1,
+      "SystemCode": "demo",
+      "Email": "user@example.com",
+      "Status": "active",
+      "Role": "user",
+      "CreatedAt": "2025-01-21T10:00:00Z",
+      "UpdatedAt": "2025-01-21T10:00:00Z",
+      "total_balance": 155,
+      "balance_buckets": [
+        {
+          "ID": 1,
+          "UserID": 1,
+          "BucketType": "free",
+          "TotalPoints": 10,
+          "RemainingPoints": 5,
+          "ExpiresAt": null,
+          "CreatedAt": "2025-01-21T10:00:00Z",
+          "UpdatedAt": "2025-01-21T10:00:00Z"
+        },
+        {
+          "ID": 2,
+          "UserID": 1,
+          "BucketType": "subscription",
+          "TotalPoints": 200,
+          "RemainingPoints": 150,
+          "ExpiresAt": "2025-02-21T10:00:00Z",
+          "CreatedAt": "2025-01-21T10:00:00Z",
+          "UpdatedAt": "2025-01-21T10:00:00Z"
+        }
+      ]
+    }
+  ],
+  "total": 150,
+  "page": 1,
+  "page_size": 20
+}
+```
+
+| 字段 | 说明 |
+|------|------|
+| total_balance | 用户当前可用的总剩余积分（仅统计未过期的积分桶） |
+| balance_buckets | 详细的积分桶列表（仅当 `include_balances=true` 时返回） |
+
+**使用示例**：
+
+```bash
+# 列出所有用户
+curl -X GET "http://localhost:8080/admin/users" \
+  -H "Authorization: Bearer <admin_token>"
+
+# 按 system_code 筛选并包含余额
+curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances=true" \
+  -H "Authorization: Bearer <admin_token>"
+```
 ```
 
 ---
@@ -963,6 +1029,51 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ---
 
+### 查询用户余额（管理员）
+
+`GET /admin/users/{id}/balances` **仅限管理员**
+
+查询指定用户的积分余额。
+
+**路径参数**：
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| id | int64 | 用户 ID |
+
+**响应**（200）：
+```json
+[
+  {
+    "ID": 1,
+    "UserID": 1,
+    "BucketType": "free",
+    "TotalPoints": 10,
+    "RemainingPoints": 5,
+    "ExpiresAt": null,
+    "CreatedAt": "2025-01-21T10:00:00Z",
+    "UpdatedAt": "2025-01-21T10:00:00Z"
+  },
+  {
+    "ID": 2,
+    "UserID": 1,
+    "BucketType": "subscription",
+    "TotalPoints": 200,
+    "RemainingPoints": 150,
+    "ExpiresAt": "2025-02-21T10:00:00Z",
+    "CreatedAt": "2025-01-21T10:00:00Z",
+    "UpdatedAt": "2025-01-21T10:00:00Z"
+  }
+]
+```
+
+**错误情况**：
+| 状态码 | 场景 |
+|--------|------|
+| 403 | 非管理员访问 |
+| 404 | 用户不存在 |
+
+---
+
 ### 系统统计
 
 `GET /admin/stats` **仅限管理员**
@@ -995,6 +1106,74 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 | total_revenue_cents | 历史总收入（美分） |
 | period_revenue_cents | 指定时段收入（美分） |
 | new_users_in_period | 时段内新增用户数 |
+
+---
+
+## 内部服务接口
+
+以下接口供内部微服务调用，使用 `X-API-Key` 头部认证（环境变量 `USAGE_API_KEY`）。
+
+### 查询用户余额（内部服务）
+
+`GET /internal/users/{id}/balances` **服务间接口**
+
+查询指定用户的积分余额。供内部服务调用，用于在扣费前检查用户余额等场景。
+
+**请求头**：
+| 头部 | 必填 | 说明 |
+|------|------|------|
+| X-API-Key | 是 | 服务间认证密钥（环境变量 `USAGE_API_KEY`） |
+
+**路径参数**：
+| 参数 | 类型 | 说明 |
+|------|------|------|
+| id | int64 | 用户 ID |
+
+**响应**（200）：
+```json
+[
+  {
+    "ID": 1,
+    "UserID": 1,
+    "BucketType": "free",
+    "TotalPoints": 10,
+    "RemainingPoints": 5,
+    "ExpiresAt": null,
+    "CreatedAt": "2025-01-21T10:00:00Z",
+    "UpdatedAt": "2025-01-21T10:00:00Z"
+  },
+  {
+    "ID": 2,
+    "UserID": 1,
+    "BucketType": "subscription",
+    "TotalPoints": 200,
+    "RemainingPoints": 150,
+    "ExpiresAt": "2025-02-21T10:00:00Z",
+    "CreatedAt": "2025-01-21T10:00:00Z",
+    "UpdatedAt": "2025-01-21T10:00:00Z"
+  }
+]
+```
+
+**积分桶类型**：
+| 类型 | 说明 |
+|------|------|
+| `free` | 免费注册赠送积分，无过期时间 |
+| `subscription` | 订阅发放积分，周期内有效 |
+| `prepaid` | 预充值购买积分，有过期时间 |
+
+**错误情况**：
+| 状态码 | 场景 |
+|--------|------|
+| 401 | X-API-Key 缺失或无效 |
+| 404 | 用户不存在 |
+| 503 | 服务间 API Key 未配置 |
+
+**使用示例**：
+```bash
+curl -X GET "http://localhost:8080/internal/users/1/balances" \
+  -H "X-API-Key: your_usage_api_key"
+```
 
 ---
 
