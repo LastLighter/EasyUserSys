@@ -39,61 +39,64 @@ func (s *Server) Routes() http.Handler {
 	r.Use(middleware.Recoverer)
 	r.Use(s.corsMiddleware)
 
-	// 公开接口
-	r.Post("/auth/login", s.handleLogin)
-	r.Get("/auth/google", s.handleGoogleLogin)
-	r.Get("/auth/google/callback", s.handleGoogleCallback)
-	r.Post("/auth/send-verification-code", s.handleSendVerificationCode)
-	r.Post("/auth/verify-code", s.handleVerifyCode)
-	r.Post("/auth/reset-password", s.handleResetPassword)
-	r.Post("/users", s.handleCreateUser)
-	r.Get("/users/by-email", s.handleGetUserByEmail)
-	r.Get("/plans", s.handleListPlans)
-	r.Post("/webhooks/stripe", s.handleStripeWebhook)
+	// 所有 API 路由都在 /api 前缀下
+	r.Route("/api", func(r chi.Router) {
+		// 公开接口
+		r.Post("/auth/login", s.handleLogin)
+		r.Get("/auth/google", s.handleGoogleLogin)
+		r.Get("/auth/google/callback", s.handleGoogleCallback)
+		r.Post("/auth/send-verification-code", s.handleSendVerificationCode)
+		r.Post("/auth/verify-code", s.handleVerifyCode)
+		r.Post("/auth/reset-password", s.handleResetPassword)
+		r.Post("/users", s.handleCreateUser)
+		r.Get("/users/by-email", s.handleGetUserByEmail)
+		r.Get("/plans", s.handleListPlans)
+		r.Post("/webhooks/stripe", s.handleStripeWebhook)
 
-	// 服务间接口（使用 API Key 验证）
-	r.Post("/usage", s.handleReportUsage)
+		// 服务间接口（使用 API Key 验证）
+		r.Post("/usage", s.handleReportUsage)
 
-	// 需要认证的用户接口
-	r.Group(func(r chi.Router) {
-		r.Use(s.jwtMiddleware)
+		// 需要认证的用户接口
+		r.Group(func(r chi.Router) {
+			r.Use(s.jwtMiddleware)
 
-		r.Get("/users/{id}", s.handleGetUser)
-		r.Patch("/users/{id}/status", s.handleUpdateUserStatus)
-		r.Get("/users/{id}/balances", s.handleListBalances)
-		r.Post("/users/{id}/api-keys", s.handleCreateAPIKey)
-		r.Get("/users/{id}/api-keys", s.handleListAPIKeys)
-		r.Post("/api-keys/{id}/revoke", s.handleRevokeAPIKey)
+			r.Get("/users/{id}", s.handleGetUser)
+			r.Patch("/users/{id}/status", s.handleUpdateUserStatus)
+			r.Get("/users/{id}/balances", s.handleListBalances)
+			r.Post("/users/{id}/api-keys", s.handleCreateAPIKey)
+			r.Get("/users/{id}/api-keys", s.handleListAPIKeys)
+			r.Post("/api-keys/{id}/revoke", s.handleRevokeAPIKey)
 
-		r.Post("/subscriptions/checkout", s.handleCreateSubscriptionCheckout)
-		r.Post("/subscriptions/{id}/cancel", s.handleCancelSubscription)
-		r.Get("/subscriptions/{id}", s.handleGetSubscription)
+			r.Post("/subscriptions/checkout", s.handleCreateSubscriptionCheckout)
+			r.Post("/subscriptions/{id}/cancel", s.handleCancelSubscription)
+			r.Get("/subscriptions/{id}", s.handleGetSubscription)
 
-		r.Post("/prepaid/checkout", s.handleCreatePrepaidCheckout)
+			r.Post("/prepaid/checkout", s.handleCreatePrepaidCheckout)
 
-		r.Get("/usage", s.handleListUsage)
+			r.Get("/usage", s.handleListUsage)
 
-		r.Get("/orders/{id}", s.handleGetOrder)
-	})
+			r.Get("/orders/{id}", s.handleGetOrder)
+		})
 
-	// 管理员接口
-	r.Route("/admin", func(r chi.Router) {
-		r.Use(s.jwtMiddleware)
-		r.Use(s.adminMiddleware)
+		// 管理员接口
+		r.Route("/admin", func(r chi.Router) {
+			r.Use(s.jwtMiddleware)
+			r.Use(s.adminMiddleware)
 
-		r.Get("/users", s.handleAdminListUsers)
-		r.Patch("/users/{id}/role", s.handleAdminUpdateUserRole)
-		r.Get("/users/{id}/usage", s.handleAdminGetUserUsage)
-		r.Get("/users/{id}/subscriptions", s.handleAdminGetUserSubscriptions)
-		r.Get("/users/{id}/balances", s.handleAdminGetUserBalances)
-		r.Get("/stats", s.handleAdminGetStats)
-	})
+			r.Get("/users", s.handleAdminListUsers)
+			r.Patch("/users/{id}/role", s.handleAdminUpdateUserRole)
+			r.Get("/users/{id}/usage", s.handleAdminGetUserUsage)
+			r.Get("/users/{id}/subscriptions", s.handleAdminGetUserSubscriptions)
+			r.Get("/users/{id}/balances", s.handleAdminGetUserBalances)
+			r.Get("/stats", s.handleAdminGetStats)
+		})
 
-	// 内部服务接口（使用 X-API-Key 验证）
-	r.Route("/internal", func(r chi.Router) {
-		r.Use(s.internalAPIKeyMiddleware)
+		// 内部服务接口（使用 X-API-Key 验证）
+		r.Route("/internal", func(r chi.Router) {
+			r.Use(s.internalAPIKeyMiddleware)
 
-		r.Get("/users/{id}/balances", s.handleInternalGetUserBalances)
+			r.Get("/users/{id}/balances", s.handleInternalGetUserBalances)
+		})
 	})
 
 	return r
