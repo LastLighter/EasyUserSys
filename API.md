@@ -151,7 +151,7 @@ window.location.href = '/api/auth/google?system_code=demo';
 
 `GET /api/auth/google/callback` **公开**
 
-处理 Google OAuth 回调，完成登录并返回 JWT Token。
+处理 Google OAuth 回调，完成登录并重定向到前端页面。
 
 **查询参数**（由 Google 自动附加）：
 | 参数 | 类型 | 说明 |
@@ -159,40 +159,68 @@ window.location.href = '/api/auth/google?system_code=demo';
 | code | string | 授权码 |
 | state | string | 包含 CSRF token 和 system_code 的编码字符串 |
 
-**响应**（200）：
-```json
-{
-  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
-  "is_new_user": true,
-  "user": {
-    "id": 1,
-    "system_code": "demo",
-    "email": "user@gmail.com",
-    "role": "user"
+**响应行为**：
+
+1. **配置了 `frontend_callback_url` 时**（推荐）：
+   - 成功：重定向到 `{frontend_callback_url}?token={jwt_token}&is_new_user={true|false}`
+   - 失败：重定向到 `{frontend_callback_url}?error={error_code}`
+
+   错误码说明：
+   | error | 说明 |
+   |-------|------|
+   | oauth_error | Google 授权被拒绝或出错 |
+   | missing_code | 缺少授权码 |
+   | token_exchange_failed | Token 交换失败 |
+   | get_user_info_failed | 获取用户信息失败 |
+   | email_not_verified | Google 邮箱未验证 |
+   | create_user_failed | 创建用户失败 |
+   | user_disabled | 用户账号已被禁用 |
+   | token_generation_failed | JWT 生成失败 |
+
+2. **未配置 `frontend_callback_url` 时**（用于测试）：
+   返回 JSON 响应（200）：
+   ```json
+   {
+     "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+     "is_new_user": true,
+     "user": {
+       "id": 1,
+       "system_code": "demo",
+       "email": "user@gmail.com",
+       "role": "user"
+     }
+   }
+   ```
+
+**前端回调页面处理示例**：
+```javascript
+// 在 frontend_callback_url 对应的页面
+function handleOAuthCallback() {
+  const params = new URLSearchParams(window.location.search);
+  
+  const error = params.get('error');
+  if (error) {
+    // 处理错误
+    console.error('OAuth 登录失败:', error);
+    return;
+  }
+  
+  const token = params.get('token');
+  const isNewUser = params.get('is_new_user') === 'true';
+  
+  if (token) {
+    // 保存 token 并跳转到控制台
+    localStorage.setItem('token', token);
+    window.location.href = '/dashboard';
   }
 }
 ```
-
-| 字段 | 类型 | 说明 |
-|------|------|------|
-| token | string | JWT Token，用于后续 API 调用 |
-| is_new_user | boolean | 是否为首次登录（新创建的用户） |
-| user | object | 用户基本信息 |
-
-**错误情况**：
-| 状态码 | 场景 |
-|--------|------|
-| 400 | state 参数无效（可能是 CSRF 攻击）|
-| 400 | Google 邮箱未验证 |
-| 400 | 缺少授权码 |
-| 403 | 用户账号已被禁用 |
-| 500 | Token 交换失败或获取用户信息失败 |
-| 503 | Google OAuth 未配置 |
 
 **特殊说明**：
 - 首次登录会自动创建用户，并赠送免费积分（与邮箱注册相同）
 - 如果邮箱已存在（之前用密码注册），会自动绑定 Google 账号
 - 已禁用的用户无法通过 Google 登录
+- 需要在环境变量 `GOOGLE_OAUTH_CONFIGS` 中配置 `frontend_callback_url`
 
 ---
 
@@ -1221,15 +1249,16 @@ curl -X GET "http://localhost:8080/api/internal/users/1/balances" \
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. 用户点击「使用 Google 登录」                                   │
 │                              ↓                                  │
-│  2. 前端跳转到 GET /api/auth/google                              │
+│  2. 前端跳转到 GET /api/auth/google?system_code=xxx              │
 │                              ↓                                  │
 │  3. 用户在 Google 页面授权                                        │
 │                              ↓                                  │
 │  4. Google 回调 GET /api/auth/google/callback                    │
 │                              ↓                                  │
-│  5. 后端返回 JWT Token（首次登录自动创建用户）                       │
+│  5. 后端重定向到前端回调页面（携带 token 和 is_new_user 参数）        │
+│     例如：https://app.com/auth/callback?token=xxx&is_new_user=true│
 │                              ↓                                  │
-│  6. 前端保存 token，后续请求携带 Authorization: Bearer <token>     │
+│  6. 前端回调页面解析 URL 参数，保存 token，跳转到控制台              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1308,30 +1337,38 @@ function loginWithGoogle(systemCode) {
   window.location.href = `/api/auth/google?system_code=${systemCode}`;
 }
 
-// 0c. Google 登录回调处理（在回调页面调用）
-// 注意：回调 URL 会直接返回 JSON，前端需要处理响应
-async function handleGoogleCallback() {
-  const urlParams = new URLSearchParams(window.location.search);
-  const code = urlParams.get('code');
-  const state = urlParams.get('state');
+// 0c. Google 登录回调处理（在前端回调页面调用，如 /auth/callback）
+// 后端会重定向到此页面，URL 中携带 token 和 is_new_user 参数
+function handleGoogleCallback() {
+  const params = new URLSearchParams(window.location.search);
   
-  if (code && state) {
-    // state 参数包含了 system_code 信息，会被后端自动解析
-    const response = await fetch(`/api/auth/google/callback${window.location.search}`);
+  // 检查是否有错误
+  const error = params.get('error');
+  if (error) {
+    // 常见错误：oauth_error, email_not_verified, user_disabled 等
+    console.error('Google 登录失败:', error);
+    // 显示错误提示或跳转到登录页
+    window.location.href = '/login?error=' + error;
+    return;
+  }
+  
+  // 获取 token
+  const token = params.get('token');
+  const isNewUser = params.get('is_new_user') === 'true';
+  
+  if (token) {
+    // 保存 token
+    setToken(token);
     
-    if (!response.ok) {
-      const error = await response.json();
-      throw new Error(error.error || 'Google 登录失败');
-    }
-    
-    const data = await response.json();
-    setToken(data.token);
-    
-    if (data.is_new_user) {
+    if (isNewUser) {
       console.log('欢迎新用户！');
     }
     
-    return data.user;
+    // 跳转到控制台
+    window.location.href = '/dashboard';
+  } else {
+    // 没有 token，跳转到登录页
+    window.location.href = '/login';
   }
 }
 
@@ -1436,11 +1473,12 @@ async function getUserBalance(userId) {
 
 5. **Google OAuth 登录**
    - `system_code` 通过 state 参数传递，避免跨域 cookie 问题
-   - 回调接口返回 JSON 响应，前端需要处理
+   - 回调成功后重定向到配置的 `frontend_callback_url`，URL 参数携带 `token` 和 `is_new_user`
+   - 回调失败时重定向到 `frontend_callback_url`，URL 参数携带 `error` 错误码
    - 首次登录自动创建账号并赠送免费积分
    - 如果用户已用邮箱注册，会自动绑定 Google 账号
    - 需要在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 配置 OAuth 2.0 凭据
-   - 确保 redirect_url 配置正确，包含 `/api` 前缀
+   - 确保 `redirect_url`（后端回调）和 `frontend_callback_url`（前端回调）配置正确
 
 6. **邮件验证码**
    - 验证码有效期默认 10 分钟（可配置）

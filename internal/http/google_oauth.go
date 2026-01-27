@@ -133,65 +133,102 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	systemCode := state.SystemCode
-	config, err := s.getGoogleOAuthConfig(systemCode)
-	if err != nil {
-		respondError(w, http.StatusServiceUnavailable, err)
+
+	// 获取 Google OAuth 配置（包含前端回调地址）
+	googleCfg, ok := s.cfg.GoogleOAuthFor(systemCode)
+	if !ok || googleCfg.ClientID == "" || googleCfg.ClientSecret == "" || googleCfg.RedirectURL == "" {
+		respondError(w, http.StatusServiceUnavailable, errors.New("Google OAuth not configured"))
 		return
+	}
+
+	config := &oauth2.Config{
+		ClientID:     googleCfg.ClientID,
+		ClientSecret: googleCfg.ClientSecret,
+		RedirectURL:  googleCfg.RedirectURL,
+		Scopes: []string{
+			"https://www.googleapis.com/auth/userinfo.email",
+			"https://www.googleapis.com/auth/userinfo.profile",
+		},
+		Endpoint: google.Endpoint,
+	}
+
+	frontendCallbackURL := googleCfg.FrontendCallbackURL
+
+	// 辅助函数：重定向到前端并带上错误信息
+	redirectWithError := func(errMsg string) {
+		if frontendCallbackURL != "" {
+			redirectURL := frontendCallbackURL + "?error=" + errMsg
+			http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+		} else {
+			respondError(w, http.StatusBadRequest, errors.New(errMsg))
+		}
 	}
 
 	// 检查是否有错误
 	if errMsg := r.URL.Query().Get("error"); errMsg != "" {
-		respondError(w, http.StatusBadRequest, errors.New("OAuth error: "+errMsg))
+		redirectWithError("oauth_error")
 		return
 	}
 
 	// 获取授权码
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		respondError(w, http.StatusBadRequest, errors.New("missing authorization code"))
+		redirectWithError("missing_code")
 		return
 	}
 
 	// 交换授权码获取访问令牌
 	token, err := config.Exchange(context.Background(), code)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, errors.New("failed to exchange token: "+err.Error()))
+		redirectWithError("token_exchange_failed")
 		return
 	}
 
 	// 获取用户信息
 	userInfo, err := s.getGoogleUserInfo(config, token)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, err)
+		redirectWithError("get_user_info_failed")
 		return
 	}
 
 	// 验证邮箱
 	if !userInfo.VerifiedEmail {
-		respondError(w, http.StatusBadRequest, errors.New("email not verified"))
+		redirectWithError("email_not_verified")
 		return
 	}
 
 	// 获取或创建用户
 	user, isNewUser, err := s.svc.GetOrCreateUserByGoogleID(r.Context(), systemCode, userInfo.ID, userInfo.Email)
 	if err != nil {
-		s.respondServiceError(w, err)
+		redirectWithError("create_user_failed")
 		return
 	}
 
 	// 检查用户状态
 	if user.Status != "active" {
-		respondError(w, http.StatusForbidden, errors.New("user account is disabled"))
+		redirectWithError("user_disabled")
 		return
 	}
 
 	// 生成 JWT Token
 	jwtToken, err := s.generateJWT(user.ID, user.Email, user.Role)
 	if err != nil {
-		respondError(w, http.StatusInternalServerError, err)
+		redirectWithError("token_generation_failed")
 		return
 	}
 
+	// 如果配置了前端回调地址，重定向到前端
+	if frontendCallbackURL != "" {
+		isNewUserStr := "false"
+		if isNewUser {
+			isNewUserStr = "true"
+		}
+		redirectURL := frontendCallbackURL + "?token=" + jwtToken + "&is_new_user=" + isNewUserStr
+		http.Redirect(w, r, redirectURL, http.StatusTemporaryRedirect)
+		return
+	}
+
+	// 如果没有配置前端回调地址，返回 JSON（用于测试或 API 调用）
 	respondJSON(w, http.StatusOK, map[string]any{
 		"token":       jwtToken,
 		"is_new_user": isNewUser,

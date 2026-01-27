@@ -31,15 +31,16 @@ type Config struct {
 	GoogleRedirectURL  string
 	// Resend 邮件服务配置（API Key 和过期时间共享，发件人支持多应用）
 	ResendAPIKey                  string
-	ResendFromEmail               string // 兼容旧配置（单应用）
+	ResendFromEmail               string                       // 兼容旧配置（单应用）
 	ResendEmailConfigs            map[string]ResendEmailConfig // 多应用配置
 	VerificationCodeExpiryMinutes int
 }
 
 type GoogleOAuthConfig struct {
-	ClientID     string `json:"client_id"`
-	ClientSecret string `json:"client_secret"`
-	RedirectURL  string `json:"redirect_url"`
+	ClientID            string `json:"client_id"`
+	ClientSecret        string `json:"client_secret"`
+	RedirectURL         string `json:"redirect_url"`
+	FrontendCallbackURL string `json:"frontend_callback_url"` // 前端回调地址，OAuth 成功后重定向到此地址
 }
 
 type ResendEmailConfig struct {
@@ -69,25 +70,25 @@ func Load() Config {
 	}
 
 	return Config{
-		DatabaseURL:                 env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/easyusersys?sslmode=disable"),
-		ServerAddr:                  env("SERVER_ADDR", ":8080"),
-		CostPerUnit:                 envInt("COST_PER_UNIT", 1),
-		FreeSignupPoints:            envInt("FREE_SIGNUP_POINTS", 10),
-		StripeSecretKey:             env("STRIPE_SECRET_KEY", ""),
-		StripeWebhookSecret:         env("STRIPE_WEBHOOK_SECRET", ""),
-		StripePriceMonthly:          env("STRIPE_PRICE_MONTHLY", ""),
-		StripePriceQuarterly:        env("STRIPE_PRICE_QUARTERLY", ""),
-		StripeCurrency:              env("STRIPE_CURRENCY", "usd"),
-		SubscriptionMonthlyPoints:   envInt("SUBSCRIPTION_MONTHLY_POINTS", 200),
-		SubscriptionQuarterlyPoints: envInt("SUBSCRIPTION_QUARTERLY_POINTS", 600),
-		PrepaidExpiryDays:           envInt("PREPAID_EXPIRY_DAYS", 30),
-		JWTSecretKey:                env("JWT_SECRET_KEY", ""),
-		JWTExpiryHours:              envInt("JWT_EXPIRY_HOURS", 168),
-		UsageAPIKey:                 env("USAGE_API_KEY", ""),
-		GoogleOAuthConfigs:          googleConfigs,
-		GoogleClientID:              legacyGoogle.ClientID,
-		GoogleClientSecret:          legacyGoogle.ClientSecret,
-		GoogleRedirectURL:           legacyGoogle.RedirectURL,
+		DatabaseURL:                   env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/easyusersys?sslmode=disable"),
+		ServerAddr:                    env("SERVER_ADDR", ":8080"),
+		CostPerUnit:                   envInt("COST_PER_UNIT", 1),
+		FreeSignupPoints:              envInt("FREE_SIGNUP_POINTS", 10),
+		StripeSecretKey:               env("STRIPE_SECRET_KEY", ""),
+		StripeWebhookSecret:           env("STRIPE_WEBHOOK_SECRET", ""),
+		StripePriceMonthly:            env("STRIPE_PRICE_MONTHLY", ""),
+		StripePriceQuarterly:          env("STRIPE_PRICE_QUARTERLY", ""),
+		StripeCurrency:                env("STRIPE_CURRENCY", "usd"),
+		SubscriptionMonthlyPoints:     envInt("SUBSCRIPTION_MONTHLY_POINTS", 200),
+		SubscriptionQuarterlyPoints:   envInt("SUBSCRIPTION_QUARTERLY_POINTS", 600),
+		PrepaidExpiryDays:             envInt("PREPAID_EXPIRY_DAYS", 30),
+		JWTSecretKey:                  env("JWT_SECRET_KEY", ""),
+		JWTExpiryHours:                envInt("JWT_EXPIRY_HOURS", 168),
+		UsageAPIKey:                   env("USAGE_API_KEY", ""),
+		GoogleOAuthConfigs:            googleConfigs,
+		GoogleClientID:                legacyGoogle.ClientID,
+		GoogleClientSecret:            legacyGoogle.ClientSecret,
+		GoogleRedirectURL:             legacyGoogle.RedirectURL,
 		ResendAPIKey:                  env("RESEND_API_KEY", ""),
 		ResendFromEmail:               legacyFromEmail,
 		ResendEmailConfigs:            resendEmailConfigs,
