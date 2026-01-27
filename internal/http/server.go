@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"runtime/debug"
 	"strconv"
+	"strings"
 	"time"
 
 	"easyusersys/internal/config"
@@ -451,11 +452,16 @@ func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http
 	}
 	log.Printf("[INFO] [%s] Created order: id=%d", reqID, order.ID)
 
+	// 替换 URL 中的占位符
+	orderIDStr := strconv.FormatInt(order.ID, 10)
+	successURL := strings.Replace(req.SuccessURL, "{order_id}", orderIDStr, -1)
+	cancelURL := strings.Replace(req.CancelURL, "{order_id}", orderIDStr, -1)
+
 	stripe.Key = s.cfg.StripeSecretKey
 	params := &stripe.CheckoutSessionParams{
 		Mode:              stripe.String(string(stripe.CheckoutSessionModeSubscription)),
-		SuccessURL:        stripe.String(req.SuccessURL),
-		CancelURL:         stripe.String(req.CancelURL),
+		SuccessURL:        stripe.String(successURL),
+		CancelURL:         stripe.String(cancelURL),
 		ClientReferenceID: stripe.String(strconv.FormatInt(order.ID, 10)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
@@ -588,11 +594,16 @@ func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Requ
 	}
 	log.Printf("[INFO] [%s] Created prepaid order: id=%d", reqID, order.ID)
 
+	// 替换 URL 中的占位符
+	orderIDStr := strconv.FormatInt(order.ID, 10)
+	successURL := strings.Replace(req.SuccessURL, "{order_id}", orderIDStr, -1)
+	cancelURL := strings.Replace(req.CancelURL, "{order_id}", orderIDStr, -1)
+
 	stripe.Key = s.cfg.StripeSecretKey
 	params := &stripe.CheckoutSessionParams{
 		Mode:              stripe.String(string(stripe.CheckoutSessionModePayment)),
-		SuccessURL:        stripe.String(req.SuccessURL),
-		CancelURL:         stripe.String(req.CancelURL),
+		SuccessURL:        stripe.String(successURL),
+		CancelURL:         stripe.String(cancelURL),
 		ClientReferenceID: stripe.String(strconv.FormatInt(order.ID, 10)),
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
