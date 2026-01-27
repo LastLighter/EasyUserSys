@@ -40,7 +40,7 @@ type Subscription struct {
 	Status               string
 	StartedAt            time.Time
 	EndsAt               time.Time
-	StripeSubscriptionID string
+	StripeSubscriptionID *string // 可能为 NULL（pending 状态时）
 	CreatedAt            time.Time
 	UpdatedAt            time.Time
 }
@@ -84,9 +84,9 @@ type Order struct {
 	AmountCents            int
 	Points                 int
 	SubscriptionID         *int64
-	StripeSessionID        string
-	StripePaymentIntentID  string
-	StripeSubscriptionID   string
+	StripeSessionID        *string // 可能为 NULL（创建后才关联）
+	StripePaymentIntentID  *string // 可能为 NULL（支付完成后才有）
+	StripeSubscriptionID   *string // 可能为 NULL（订阅类型才有）
 	CreatedAt              time.Time
 	UpdatedAt              time.Time
 }
