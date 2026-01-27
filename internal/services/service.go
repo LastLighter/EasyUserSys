@@ -32,6 +32,9 @@ var (
 	ErrInvalidCode           = errors.New("invalid or expired verification code")
 	ErrCodeAlreadyUsed       = errors.New("verification code already used")
 	ErrTooManyRequests       = errors.New("too many requests, please try again later")
+	ErrEmailAlreadyExists    = errors.New("email already registered")
+	ErrEmailNotVerified      = errors.New("email not verified")
+	ErrUserDisabled          = errors.New("user account is disabled")
 )
 
 type Service struct {
@@ -73,6 +76,9 @@ func (s *Service) CreateUser(ctx context.Context, systemCode, email, password st
 		systemCode, email, string(passwordHash), models.UserStatusActive, models.UserRoleUser,
 	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
+		if isUniqueViolation(err) {
+			return models.User{}, ErrEmailAlreadyExists
+		}
 		return models.User{}, err
 	}
 	if s.config.FreeSignupPoints > 0 {
@@ -669,12 +675,21 @@ func (s *Service) AuthenticateUser(ctx context.Context, systemCode, email, passw
 		return models.User{}, err
 	}
 
-	if user.Status != models.UserStatusActive {
+	// 先检查密码是否正确
+	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
 		return models.User{}, ErrInvalidCredentials
 	}
 
-	if err := bcrypt.CompareHashAndPassword([]byte(user.PasswordHash), []byte(password)); err != nil {
-		return models.User{}, ErrInvalidCredentials
+	// 密码正确后，检查用户状态
+	switch user.Status {
+	case models.UserStatusActive:
+		// 用户状态正常，允许登录
+	case models.UserStatusPendingVerification:
+		return models.User{}, ErrEmailNotVerified
+	case models.UserStatusDisabled:
+		return models.User{}, ErrUserDisabled
+	default:
+		return models.User{}, ErrUserDisabled
 	}
 
 	return user, nil
@@ -961,11 +976,12 @@ func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, systemCode, goo
 	}
 
 	// 用户不存在，创建新用户
+	// 注意：Google OAuth 用户没有密码，但 password_hash 是 NOT NULL，所以使用空字符串
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO users (system_code, email, google_id, status, role)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO users (system_code, email, password_hash, google_id, status, role)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		RETURNING id, system_code, email, password_hash, google_id, status, role, created_at, updated_at`,
-		systemCode, email, googleID, models.UserStatusActive, models.UserRoleUser,
+		systemCode, email, "", googleID, models.UserStatusActive, models.UserRoleUser,
 	).Scan(&user.ID, &user.SystemCode, &user.Email, &user.PasswordHash, &user.GoogleID, &user.Status, &user.Role, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
 		return models.User{}, false, err

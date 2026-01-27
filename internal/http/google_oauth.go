@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
-	"time"
 
 	"golang.org/x/oauth2"
 	"golang.org/x/oauth2/google"
@@ -20,6 +19,12 @@ type GoogleUserInfo struct {
 	VerifiedEmail bool   `json:"verified_email"`
 	Name          string `json:"name"`
 	Picture       string `json:"picture"`
+}
+
+// oauthState OAuth state 参数结构，包含 CSRF token 和 system_code
+type oauthState struct {
+	CSRFToken  string `json:"csrf_token"`
+	SystemCode string `json:"system_code"`
 }
 
 // getGoogleOAuthConfig 获取 Google OAuth 配置
@@ -40,13 +45,33 @@ func (s *Server) getGoogleOAuthConfig(systemCode string) (*oauth2.Config, error)
 	}, nil
 }
 
-// generateStateToken 生成随机状态令牌用于防止 CSRF 攻击
-func generateStateToken() (string, error) {
+// generateCSRFToken 生成随机 CSRF 令牌
+func generateCSRFToken() (string, error) {
 	b := make([]byte, 32)
 	if _, err := rand.Read(b); err != nil {
 		return "", err
 	}
 	return base64.URLEncoding.EncodeToString(b), nil
+}
+
+// encodeOAuthState 将 state 结构编码为字符串
+func encodeOAuthState(state oauthState) (string, error) {
+	jsonData, err := json.Marshal(state)
+	if err != nil {
+		return "", err
+	}
+	return base64.URLEncoding.EncodeToString(jsonData), nil
+}
+
+// decodeOAuthState 从字符串解码 state 结构
+func decodeOAuthState(encoded string) (oauthState, error) {
+	var state oauthState
+	jsonData, err := base64.URLEncoding.DecodeString(encoded)
+	if err != nil {
+		return state, err
+	}
+	err = json.Unmarshal(jsonData, &state)
+	return state, err
 }
 
 // handleGoogleLogin 处理 Google OAuth 登录请求
@@ -63,74 +88,56 @@ func (s *Server) handleGoogleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state, err := generateStateToken()
+	// 生成 CSRF token
+	csrfToken, err := generateCSRFToken()
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
 	}
 
-	// 将 state 存储在 cookie 中，用于回调时验证
-	http.SetCookie(w, &http.Cookie{
-		Name:     "oauth_state",
-		Value:    state,
-		Path:     "/",
-		MaxAge:   int(10 * time.Minute / time.Second),
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-	})
-	// 存储 system_code，用于回调时确定租户
-	http.SetCookie(w, &http.Cookie{
-		Name:     "oauth_system_code",
-		Value:    systemCode,
-		Path:     "/",
-		MaxAge:   int(10 * time.Minute / time.Second),
-		HttpOnly: true,
-		Secure:   r.TLS != nil,
-		SameSite: http.SameSiteLaxMode,
-	})
+	// 将 CSRF token 和 system_code 一起编码到 state 参数中
+	// state 参数会被 Google 原样返回，避免了跨域 cookie 问题
+	state := oauthState{
+		CSRFToken:  csrfToken,
+		SystemCode: systemCode,
+	}
+	encodedState, err := encodeOAuthState(state)
+	if err != nil {
+		respondError(w, http.StatusInternalServerError, err)
+		return
+	}
 
-	url := config.AuthCodeURL(state, oauth2.AccessTypeOffline)
+	url := config.AuthCodeURL(encodedState, oauth2.AccessTypeOffline)
 	http.Redirect(w, r, url, http.StatusTemporaryRedirect)
 }
 
 // handleGoogleCallback 处理 Google OAuth 回调
 func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
-	// 验证 state 参数以防止 CSRF 攻击
-	state := r.URL.Query().Get("state")
-	cookie, err := r.Cookie("oauth_state")
-	if err != nil || cookie.Value != state {
+	// 从 state 参数中解码 CSRF token 和 system_code
+	encodedState := r.URL.Query().Get("state")
+	if encodedState == "" {
+		respondError(w, http.StatusBadRequest, errors.New("missing state parameter"))
+		return
+	}
+
+	state, err := decodeOAuthState(encodedState)
+	if err != nil {
 		respondError(w, http.StatusBadRequest, errors.New("invalid state parameter"))
 		return
 	}
-	systemCookie, err := r.Cookie("oauth_system_code")
-	if err != nil || systemCookie.Value == "" {
-		respondError(w, http.StatusBadRequest, errors.New("system_code missing"))
+
+	// 验证 state 中的数据
+	if state.CSRFToken == "" || state.SystemCode == "" {
+		respondError(w, http.StatusBadRequest, errors.New("invalid state parameter"))
 		return
 	}
-	systemCode := systemCookie.Value
+
+	systemCode := state.SystemCode
 	config, err := s.getGoogleOAuthConfig(systemCode)
 	if err != nil {
 		respondError(w, http.StatusServiceUnavailable, err)
 		return
 	}
-
-	// 清除 state cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     "oauth_state",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-	})
-	// 清除 system_code cookie
-	http.SetCookie(w, &http.Cookie{
-		Name:     "oauth_system_code",
-		Value:    "",
-		Path:     "/",
-		MaxAge:   -1,
-		HttpOnly: true,
-	})
 
 	// 检查是否有错误
 	if errMsg := r.URL.Query().Get("error"); errMsg != "" {

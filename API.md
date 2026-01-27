@@ -5,16 +5,18 @@
 ### 基础地址
 
 ```
-http://localhost:8080
+http://localhost:8080/api
 ```
+
+> 所有接口都以 `/api` 为前缀，例如登录接口完整路径为 `http://localhost:8080/api/auth/login`
 
 ### 认证
 
 本系统使用 JWT（JSON Web Token）进行身份认证。
 
 **获取 Token**：通过以下方式获取 JWT Token：
-- 邮箱密码登录：`POST /auth/login`
-- Google 账号登录：`GET /auth/google` → `GET /auth/google/callback`
+- 邮箱密码登录：`POST /api/auth/login`
+- Google 账号登录：`GET /api/auth/google` → `GET /api/auth/google/callback`
 
 **携带 Token**：在需要认证的接口请求头中添加：
 
@@ -68,7 +70,7 @@ Authorization: Bearer <your_jwt_token>
 
 ### 用户登录
 
-`POST /auth/login` **公开**
+`POST /api/auth/login` **公开**
 
 验证用户凭证，返回 JWT Token。
 
@@ -101,10 +103,12 @@ Authorization: Bearer <your_jwt_token>
 ```
 
 **错误情况**：
-| 状态码 | 场景 |
-|--------|------|
-| 401 | 邮箱或密码错误 |
-| 400 | 缺少必要参数 |
+| 状态码 | 错误信息 | 场景 |
+|--------|----------|------|
+| 400 | system_code, email and password are required | 缺少必要参数 |
+| 401 | invalid email or password | 邮箱或密码错误 |
+| 403 | email not verified | 邮箱未验证 |
+| 403 | user account is disabled | 用户账号已被禁用 |
 
 ---
 
@@ -114,14 +118,14 @@ Authorization: Bearer <your_jwt_token>
 
 #### 发起 Google 登录
 
-`GET /auth/google` **公开**
+`GET /api/auth/google` **公开**
 
 重定向用户到 Google 授权页面。
 
 **使用方式**：
 ```javascript
 // 前端直接跳转
-window.location.href = '/auth/google?system_code=demo';
+window.location.href = '/api/auth/google?system_code=demo';
 ```
 **查询参数**：
 | 参数 | 类型 | 必填 | 说明 |
@@ -130,10 +134,11 @@ window.location.href = '/auth/google?system_code=demo';
 
 
 **流程说明**：
-1. 用户访问此接口
-2. 服务端生成 CSRF state token 并设置 cookie
+1. 用户访问此接口，传入 `system_code` 参数
+2. 服务端生成包含 CSRF token 和 system_code 的 state 参数
 3. 用户被重定向到 Google 授权页面
-4. 用户授权后，Google 重定向回 `/auth/google/callback`
+4. 用户授权后，Google 携带 state 参数重定向回 `/api/auth/google/callback`
+5. 服务端从 state 参数中解析出 system_code，完成登录
 
 **错误情况**：
 | 状态码 | 场景 |
@@ -144,7 +149,7 @@ window.location.href = '/auth/google?system_code=demo';
 
 #### Google 登录回调
 
-`GET /auth/google/callback` **公开**
+`GET /api/auth/google/callback` **公开**
 
 处理 Google OAuth 回调，完成登录并返回 JWT Token。
 
@@ -152,7 +157,7 @@ window.location.href = '/auth/google?system_code=demo';
 | 参数 | 类型 | 说明 |
 |------|------|------|
 | code | string | 授权码 |
-| state | string | CSRF 防护令牌 |
+| state | string | 包含 CSRF token 和 system_code 的编码字符串 |
 
 **响应**（200）：
 ```json
@@ -193,7 +198,7 @@ window.location.href = '/auth/google?system_code=demo';
 
 ### 发送验证码
 
-`POST /auth/send-verification-code` **公开**
+`POST /api/auth/send-verification-code` **公开**
 
 发送邮箱验证码，用于注册验证或找回密码。每个邮箱每分钟最多发送 1 次。
 
@@ -254,7 +259,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 ### 验证验证码
 
-`POST /auth/verify-code` **公开**
+`POST /api/auth/verify-code` **公开**
 
 验证邮箱验证码是否正确有效。
 
@@ -292,7 +297,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 ### 重置密码
 
-`POST /auth/reset-password` **公开**
+`POST /api/auth/reset-password` **公开**
 
 使用验证码重置用户密码。需要先获取验证码。
 
@@ -332,14 +337,14 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. 用户输入邮箱，点击「发送验证码」                               │
 │                              ↓                                  │
-│  2. 前端调用 POST /auth/send-verification-code                  │
+│  2. 前端调用 POST /api/auth/send-verification-code              │
 │     { code_type: "reset_password" }                            │
 │                              ↓                                  │
 │  3. 用户收到验证码邮件                                            │
 │                              ↓                                  │
 │  4. 用户输入验证码和新密码                                         │
 │                              ↓                                  │
-│  5. 前端调用 POST /auth/reset-password                          │
+│  5. 前端调用 POST /api/auth/reset-password                      │
 │                              ↓                                  │
 │  6. 密码重置成功，引导用户登录                                      │
 └─────────────────────────────────────────────────────────────────┘
@@ -351,7 +356,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 ### 创建用户
 
-`POST /users` **公开**
+`POST /api/users` **公开**
 
 创建新用户（注册）。新用户会自动获得免费注册积分（默认 10 点）。
 
@@ -383,11 +388,17 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 }
 ```
 
+**错误情况**：
+| 状态码 | 错误信息 | 场景 |
+|--------|----------|------|
+| 400 | system_code, email and password are required | 缺少必要参数 |
+| 409 | email already registered | 邮箱已被注册 |
+
 ---
 
 ### 查询用户
 
-`GET /users/{id}` **需要认证** **仅限本人**
+`GET /api/users/{id}` **需要认证** **仅限本人**
 
 **路径参数**：
 | 参数 | 类型 | 说明 |
@@ -411,7 +422,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 ### 通过邮箱查询用户
 
-`GET /users/by-email?system_code={system_code}&email={email}` **公开**
+`GET /api/users/by-email?system_code={system_code}&email={email}` **公开**
 
 **查询参数**：
 | 参数 | 类型 | 必填 | 说明 |
@@ -425,7 +436,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 ### 更新用户状态
 
-`PATCH /users/{id}/status` **需要认证** **仅限管理员**
+`PATCH /api/users/{id}/status` **需要认证** **仅限管理员**
 
 **请求**：
 ```json
@@ -443,6 +454,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 |------|------|
 | `active` | 正常 |
 | `disabled` | 已禁用 |
+| `pending_verification` | 邮箱待验证 |
 
 **响应**（200）：
 ```json
@@ -453,7 +465,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 ### 查询余额桶
 
-`GET /users/{id}/balances` **需要认证** **仅限本人**
+`GET /api/users/{id}/balances` **需要认证** **仅限本人**
 
 查询用户的积分余额。系统支持多种类型的积分桶，按优先级扣减。
 
@@ -498,7 +510,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 创建 API Key
 
-`POST /users/{id}/api-keys` **需要认证** **仅限本人**
+`POST /api/users/{id}/api-keys` **需要认证** **仅限本人**
 
 为指定用户创建新的 API Key。
 
@@ -524,7 +536,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 列出 API Keys
 
-`GET /users/{id}/api-keys` **需要认证** **仅限本人**
+`GET /api/users/{id}/api-keys` **需要认证** **仅限本人**
 
 列出指定用户的所有 API Key。
 
@@ -547,7 +559,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 吊销 API Key
 
-`POST /api-keys/{id}/revoke` **需要认证** **仅限本人**
+`POST /api/api-keys/{id}/revoke` **需要认证** **仅限本人**
 
 吊销指定的 API Key，吊销后不可恢复。只能吊销自己的 API Key。
 
@@ -568,7 +580,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 查询订阅计划
 
-`GET /plans` **公开**
+`GET /api/plans` **公开**
 
 获取所有可用的订阅计划。
 
@@ -605,7 +617,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 创建订阅 Checkout
 
-`POST /subscriptions/checkout` **需要认证** **仅限本人**
+`POST /api/subscriptions/checkout` **需要认证** **仅限本人**
 
 创建 Stripe 订阅支付会话，返回支付链接。只能为自己创建订阅。
 
@@ -647,7 +659,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 取消订阅
 
-`POST /subscriptions/{id}/cancel` **需要认证** **仅限本人**
+`POST /api/subscriptions/{id}/cancel` **需要认证** **仅限本人**
 
 取消指定订阅。只能取消自己的订阅。
 
@@ -660,7 +672,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 查询订阅
 
-`GET /subscriptions/{id}` **需要认证** **仅限本人**
+`GET /api/subscriptions/{id}` **需要认证** **仅限本人**
 
 **响应**（200）：
 ```json
@@ -691,7 +703,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 创建预充值 Checkout
 
-`POST /prepaid/checkout` **需要认证** **仅限本人**
+`POST /api/prepaid/checkout` **需要认证** **仅限本人**
 
 创建一次性积分充值支付会话。积分数量 = 金额（美分）/ 10，例如充值 $20.00 获得 200 积分。只能为自己充值。
 
@@ -727,7 +739,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 上报用量
 
-`POST /usage` **服务间接口**
+`POST /api/usage` **服务间接口**
 
 上报 API 调用用量，系统自动扣减积分。此接口供内部微服务调用，使用 API Key 认证。
 
@@ -773,7 +785,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 查询用量
 
-`GET /usage?user_id={user_id}&from={from}&to={to}` **需要认证** **仅限本人**
+`GET /api/usage?user_id={user_id}&from={from}&to={to}` **需要认证** **仅限本人**
 
 查询指定时间范围内的用量记录。只能查询自己的用量。
 
@@ -805,7 +817,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 查询订单
 
-`GET /orders/{id}` **需要认证** **仅限本人**
+`GET /api/orders/{id}` **需要认证** **仅限本人**
 
 查询订单详情，可用于确认支付状态。只能查询自己的订单。
 
@@ -846,7 +858,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### Stripe Webhook
 
-`POST /webhooks/stripe`
+`POST /api/webhooks/stripe`
 
 接收 Stripe 支付事件回调，由后端自动处理。
 
@@ -864,7 +876,7 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ### 列出所有用户
 
-`GET /admin/users` **仅限管理员**
+`GET /api/admin/users` **仅限管理员**
 
 分页列出所有用户，支持按系统标识筛选，并可同时查询用户积分余额。
 
@@ -951,11 +963,11 @@ API Key 用于标识和验证应用程序的 API 调用身份。
 
 ```bash
 # 列出所有用户
-curl -X GET "http://localhost:8080/admin/users" \
+curl -X GET "http://localhost:8080/api/admin/users" \
   -H "Authorization: Bearer <admin_token>"
 
 # 按 system_code 筛选并包含余额
-curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances=true" \
+curl -X GET "http://localhost:8080/api/admin/users?system_code=demo&include_balances=true" \
   -H "Authorization: Bearer <admin_token>"
 ```
 ```
@@ -964,7 +976,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 ### 更新用户角色
 
-`PATCH /admin/users/{id}/role` **仅限管理员**
+`PATCH /api/admin/users/{id}/role` **仅限管理员**
 
 更新指定用户的角色。
 
@@ -988,7 +1000,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 ### 查询用户用量
 
-`GET /admin/users/{id}/usage` **仅限管理员**
+`GET /api/admin/users/{id}/usage` **仅限管理员**
 
 查询指定用户的用量记录。
 
@@ -1006,7 +1018,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 ### 查询用户订阅
 
-`GET /admin/users/{id}/subscriptions` **仅限管理员**
+`GET /api/admin/users/{id}/subscriptions` **仅限管理员**
 
 查询指定用户的所有订阅记录。
 
@@ -1031,7 +1043,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 ### 查询用户余额（管理员）
 
-`GET /admin/users/{id}/balances` **仅限管理员**
+`GET /api/admin/users/{id}/balances` **仅限管理员**
 
 查询指定用户的积分余额。
 
@@ -1076,7 +1088,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 ### 系统统计
 
-`GET /admin/stats` **仅限管理员**
+`GET /api/admin/stats` **仅限管理员**
 
 获取系统统计数据。
 
@@ -1115,7 +1127,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 ### 查询用户余额（内部服务）
 
-`GET /internal/users/{id}/balances` **服务间接口**
+`GET /api/internal/users/{id}/balances` **服务间接口**
 
 查询指定用户的积分余额。供内部服务调用，用于在扣费前检查用户余额等场景。
 
@@ -1171,7 +1183,7 @@ curl -X GET "http://localhost:8080/admin/users?system_code=demo&include_balances
 
 **使用示例**：
 ```bash
-curl -X GET "http://localhost:8080/internal/users/1/balances" \
+curl -X GET "http://localhost:8080/api/internal/users/1/balances" \
   -H "X-API-Key: your_usage_api_key"
 ```
 
@@ -1191,9 +1203,9 @@ curl -X GET "http://localhost:8080/internal/users/1/balances" \
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  1. 用户注册：POST /users                                        │
+│  1. 用户注册：POST /api/users                                    │
 │                              ↓                                  │
-│  2. 用户登录：POST /auth/login                                   │
+│  2. 用户登录：POST /api/auth/login                               │
 │                              ↓                                  │
 │  3. 保存返回的 token                                             │
 │                              ↓                                  │
@@ -1209,11 +1221,11 @@ curl -X GET "http://localhost:8080/internal/users/1/balances" \
 ┌─────────────────────────────────────────────────────────────────┐
 │  1. 用户点击「使用 Google 登录」                                   │
 │                              ↓                                  │
-│  2. 前端跳转到 GET /auth/google                                  │
+│  2. 前端跳转到 GET /api/auth/google                              │
 │                              ↓                                  │
 │  3. 用户在 Google 页面授权                                        │
 │                              ↓                                  │
-│  4. Google 回调 GET /auth/google/callback                        │
+│  4. Google 回调 GET /api/auth/google/callback                    │
 │                              ↓                                  │
 │  5. 后端返回 JWT Token（首次登录自动创建用户）                       │
 │                              ↓                                  │
@@ -1225,7 +1237,7 @@ curl -X GET "http://localhost:8080/internal/users/1/balances" \
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  1. 前端调用 POST /subscriptions/checkout 或 /prepaid/checkout  │
+│  1. 前端调用 POST /api/subscriptions/checkout 或 /api/prepaid/checkout │
 │                              ↓                                  │
 │  2. 获取响应中的 order_id 和 checkout_url                        │
 │                              ↓                                  │
@@ -1235,7 +1247,7 @@ curl -X GET "http://localhost:8080/internal/users/1/balances" \
 │                              ↓                                  │
 │  5. 支付完成后，用户被重定向回 success_url                        │
 │                              ↓                                  │
-│  6. 前端调用 GET /orders/{order_id} 确认订单状态                  │
+│  6. 前端调用 GET /api/orders/{order_id} 确认订单状态              │
 │                              ↓                                  │
 │  7. 若 status = "paid"，支付成功；否则继续轮询                    │
 └─────────────────────────────────────────────────────────────────┘
@@ -1260,14 +1272,28 @@ function getAuthHeaders() {
 
 // 0a. 邮箱密码登录
 async function login(systemCode, email, password) {
-  const response = await fetch('/auth/login', {
+  const response = await fetch('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ system_code: systemCode, email, password })
   });
   
   if (!response.ok) {
-    throw new Error('登录失败');
+    const error = await response.json();
+    
+    // 处理不同的错误类型
+    if (response.status === 401) {
+      throw new Error('邮箱或密码错误');
+    }
+    if (response.status === 403) {
+      if (error.error === 'email not verified') {
+        throw new Error('邮箱未验证，请先验证邮箱');
+      }
+      if (error.error === 'user account is disabled') {
+        throw new Error('账号已被禁用');
+      }
+    }
+    throw new Error(error.error || '登录失败');
   }
   
   const data = await response.json();
@@ -1276,27 +1302,22 @@ async function login(systemCode, email, password) {
 }
 
 // 0b. Google OAuth 登录
-function loginWithGoogle() {
+function loginWithGoogle(systemCode) {
   // 直接跳转到 Google 授权页面
-  window.location.href = '/auth/google?system_code=demo';
+  // system_code 会被编码到 state 参数中，由 Google 原样返回
+  window.location.href = `/api/auth/google?system_code=${systemCode}`;
 }
 
 // 0c. Google 登录回调处理（在回调页面调用）
 // 注意：回调 URL 会直接返回 JSON，前端需要处理响应
 async function handleGoogleCallback() {
-  // 如果使用弹窗方式，可以用以下方法
-  // 但推荐直接跳转方式，回调页面处理 JSON 响应
-  
   const urlParams = new URLSearchParams(window.location.search);
   const code = urlParams.get('code');
   const state = urlParams.get('state');
   
   if (code && state) {
-    // 回调会自动处理，响应为 JSON
-    // 前端需要从响应中提取 token
-    const response = await fetch(`/auth/google/callback${window.location.search}`, {
-      credentials: 'include'  // 携带 cookie 用于 state 验证
-    });
+    // state 参数包含了 system_code 信息，会被后端自动解析
+    const response = await fetch(`/api/auth/google/callback${window.location.search}`);
     
     if (!response.ok) {
       const error = await response.json();
@@ -1316,7 +1337,7 @@ async function handleGoogleCallback() {
 
 // 1. 创建订阅支付
 async function createSubscription(userId, planId) {
-  const response = await fetch('/subscriptions/checkout', {
+  const response = await fetch('/api/subscriptions/checkout', {
     method: 'POST',
     headers: { 
       'Content-Type': 'application/json',
@@ -1351,7 +1372,7 @@ async function confirmPayment(orderId) {
   const interval = 2000; // 2秒
   
   for (let i = 0; i < maxAttempts; i++) {
-    const response = await fetch(`/orders/${orderId}`, {
+    const response = await fetch(`/api/orders/${orderId}`, {
       headers: getAuthHeaders()
     });
     const order = await response.json();
@@ -1376,7 +1397,7 @@ async function confirmPayment(orderId) {
 
 // 3. 查询用户余额
 async function getUserBalance(userId) {
-  const response = await fetch(`/users/${userId}/balances`, {
+  const response = await fetch(`/api/users/${userId}/balances`, {
     headers: getAuthHeaders()
   });
   
@@ -1397,7 +1418,7 @@ async function getUserBalance(userId) {
 
 1. **不要仅凭跳转判断支付结果**
    - 用户可能手动访问 `success_url`
-   - 必须调用 `GET /orders/{id}` 确认 `status` 为 `paid`
+   - 必须调用 `GET /api/orders/{id}` 确认 `status` 为 `paid`
 
 2. **建议的轮询策略**
    - 间隔：2 秒
@@ -1414,10 +1435,12 @@ async function getUserBalance(userId) {
    - 相同 `request_id` 不会重复扣费
 
 5. **Google OAuth 登录**
+   - `system_code` 通过 state 参数传递，避免跨域 cookie 问题
    - 回调接口返回 JSON 响应，前端需要处理
    - 首次登录自动创建账号并赠送免费积分
    - 如果用户已用邮箱注册，会自动绑定 Google 账号
    - 需要在 [Google Cloud Console](https://console.cloud.google.com/apis/credentials) 配置 OAuth 2.0 凭据
+   - 确保 redirect_url 配置正确，包含 `/api` 前缀
 
 6. **邮件验证码**
    - 验证码有效期默认 10 分钟（可配置）
@@ -1429,7 +1452,7 @@ async function getUserBalance(userId) {
 ```javascript
 // 发送重置密码验证码
 async function sendResetCode(systemCode, email) {
-  const response = await fetch('/auth/send-verification-code', {
+  const response = await fetch('/api/auth/send-verification-code', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1457,7 +1480,7 @@ async function sendResetCode(systemCode, email) {
 
 // 重置密码
 async function resetPassword(systemCode, email, code, newPassword) {
-  const response = await fetch('/auth/reset-password', {
+  const response = await fetch('/api/auth/reset-password', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -1488,8 +1511,21 @@ async function resetPassword(systemCode, email, code, newPassword) {
 | HTTP 状态码 | 错误场景 |
 |-------------|----------|
 | 400 | 参数缺失或格式错误、验证码无效/已过期 |
-| 403 | 无有效订阅或积分不足 |
+| 401 | 未认证（Token 缺失/无效）、凭证错误 |
+| 403 | 邮箱未验证、用户已禁用、无有效订阅或积分不足 |
 | 404 | 用户/订单/订阅不存在 |
-| 409 | 重复请求（如相同 request_id） |
+| 409 | 邮箱已注册、重复请求（如相同 request_id） |
 | 429 | 请求过于频繁（验证码1分钟内限发1次） |
 | 503 | Stripe/邮件服务未配置 |
+
+### 常见错误信息
+
+| 错误信息 | HTTP 状态码 | 说明 |
+|----------|-------------|------|
+| `invalid email or password` | 401 | 邮箱或密码错误 |
+| `email not verified` | 403 | 用户邮箱未验证，需先完成验证 |
+| `user account is disabled` | 403 | 用户账号已被禁用 |
+| `email already registered` | 409 | 该邮箱在此系统中已被注册 |
+| `not found` | 404 | 资源不存在 |
+| `invalid or expired verification code` | 400 | 验证码无效或已过期 |
+| `too many requests, please try again later` | 429 | 请求过于频繁 |

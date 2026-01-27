@@ -92,8 +92,9 @@ type Order struct {
 }
 
 const (
-	UserStatusActive   = "active"
-	UserStatusDisabled = "disabled"
+	UserStatusActive              = "active"
+	UserStatusDisabled            = "disabled"
+	UserStatusPendingVerification = "pending_verification"
 )
 
 const (

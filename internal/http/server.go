@@ -135,11 +135,16 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 
 	user, err := s.svc.AuthenticateUser(r.Context(), req.SystemCode, req.Email, req.Password)
 	if err != nil {
-		if errors.Is(err, services.ErrInvalidCredentials) {
+		switch {
+		case errors.Is(err, services.ErrInvalidCredentials):
 			respondError(w, http.StatusUnauthorized, err)
-			return
+		case errors.Is(err, services.ErrEmailNotVerified):
+			respondError(w, http.StatusForbidden, err)
+		case errors.Is(err, services.ErrUserDisabled):
+			respondError(w, http.StatusForbidden, err)
+		default:
+			s.respondServiceError(w, err)
 		}
-		s.respondServiceError(w, err)
 		return
 	}
 
@@ -749,6 +754,12 @@ func (s *Server) respondServiceError(w http.ResponseWriter, err error) {
 		respondError(w, http.StatusBadRequest, err)
 	case errors.Is(err, services.ErrTooManyRequests):
 		respondError(w, http.StatusTooManyRequests, err)
+	case errors.Is(err, services.ErrEmailAlreadyExists):
+		respondError(w, http.StatusConflict, err)
+	case errors.Is(err, services.ErrEmailNotVerified):
+		respondError(w, http.StatusForbidden, err)
+	case errors.Is(err, services.ErrUserDisabled):
+		respondError(w, http.StatusForbidden, err)
 	default:
 		respondError(w, http.StatusInternalServerError, err)
 	}
