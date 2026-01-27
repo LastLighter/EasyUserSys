@@ -20,9 +20,9 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/stripe/stripe-go/v76"
-	"github.com/stripe/stripe-go/v76/checkout/session"
-	"github.com/stripe/stripe-go/v76/webhook"
+	"github.com/stripe/stripe-go/v84"
+	"github.com/stripe/stripe-go/v84/checkout/session"
+	"github.com/stripe/stripe-go/v84/webhook"
 )
 
 type Server struct {
@@ -733,44 +733,69 @@ func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleStripeWebhook(w http.ResponseWriter, r *http.Request) {
+	reqID := middleware.GetReqID(r.Context())
+	log.Printf("[INFO] [%s] Received Stripe webhook", reqID)
+
 	if s.cfg.StripeWebhookSecret == "" {
+		log.Printf("[ERROR] [%s] Stripe webhook secret not configured", reqID)
 		s.respondServiceError(w, services.ErrStripeNotConfigured)
 		return
 	}
 	payload, err := io.ReadAll(r.Body)
 	if err != nil {
+		log.Printf("[ERROR] [%s] Failed to read webhook payload: %v", reqID, err)
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	log.Printf("[INFO] [%s] Webhook payload size: %d bytes", reqID, len(payload))
+
 	sigHeader := r.Header.Get("Stripe-Signature")
-	event, err := webhook.ConstructEvent(payload, sigHeader, s.cfg.StripeWebhookSecret)
-	if err != nil {
-		respondError(w, http.StatusBadRequest, err)
+	if sigHeader == "" {
+		log.Printf("[ERROR] [%s] Missing Stripe-Signature header", reqID)
+		respondError(w, http.StatusBadRequest, errors.New("missing Stripe-Signature header"))
 		return
 	}
 
+	event, err := webhook.ConstructEvent(payload, sigHeader, s.cfg.StripeWebhookSecret)
+	if err != nil {
+		log.Printf("[ERROR] [%s] Webhook signature verification failed: %v", reqID, err)
+		respondError(w, http.StatusBadRequest, fmt.Errorf("webhook signature verification failed: %w", err))
+		return
+	}
+	log.Printf("[INFO] [%s] Webhook event type: %s, event ID: %s", reqID, event.Type, event.ID)
+
 	switch event.Type {
 	case "checkout.session.completed":
+		log.Printf("[INFO] [%s] Processing checkout.session.completed", reqID)
 		var sess stripe.CheckoutSession
 		if err := json.Unmarshal(event.Data.Raw, &sess); err != nil {
+			log.Printf("[ERROR] [%s] Failed to unmarshal checkout session: %v", reqID, err)
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
+		log.Printf("[INFO] [%s] Checkout session ID: %s, ClientReferenceID: %s", reqID, sess.ID, sess.ClientReferenceID)
 		if err := s.processCheckoutSession(r.Context(), &sess); err != nil {
+			log.Printf("[ERROR] [%s] Failed to process checkout session: %v", reqID, err)
 			s.respondServiceError(w, err)
 			return
 		}
+		log.Printf("[INFO] [%s] Successfully processed checkout.session.completed", reqID)
 	case "invoice.paid":
+		log.Printf("[INFO] [%s] Processing invoice.paid", reqID)
 		var inv stripe.Invoice
 		if err := json.Unmarshal(event.Data.Raw, &inv); err != nil {
+			log.Printf("[ERROR] [%s] Failed to unmarshal invoice: %v", reqID, err)
 			respondError(w, http.StatusBadRequest, err)
 			return
 		}
 		if err := s.processInvoicePaid(r.Context(), &inv); err != nil {
+			log.Printf("[ERROR] [%s] Failed to process invoice.paid: %v", reqID, err)
 			s.respondServiceError(w, err)
 			return
 		}
+		log.Printf("[INFO] [%s] Successfully processed invoice.paid", reqID)
 	default:
+		log.Printf("[INFO] [%s] Ignoring unhandled event type: %s", reqID, event.Type)
 	}
 	respondJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -821,10 +846,15 @@ func (s *Server) processCheckoutSession(ctx context.Context, sess *stripe.Checko
 }
 
 func (s *Server) processInvoicePaid(ctx context.Context, inv *stripe.Invoice) error {
-	if inv.Subscription == nil || inv.Subscription.ID == "" {
+	// v84 API: Subscription 现在在 Parent.SubscriptionDetails.Subscription 中
+	if inv.Parent == nil || inv.Parent.SubscriptionDetails == nil || inv.Parent.SubscriptionDetails.Subscription == nil {
 		return nil
 	}
-	sub, err := s.svc.GetSubscriptionByStripeID(ctx, inv.Subscription.ID)
+	stripeSub := inv.Parent.SubscriptionDetails.Subscription
+	if stripeSub.ID == "" {
+		return nil
+	}
+	sub, err := s.svc.GetSubscriptionByStripeID(ctx, stripeSub.ID)
 	if err != nil {
 		if errors.Is(err, services.ErrNotFound) {
 			return nil
@@ -838,7 +868,7 @@ func (s *Server) processInvoicePaid(ctx context.Context, inv *stripe.Invoice) er
 	if err != nil {
 		return err
 	}
-	return s.svc.ActivateSubscription(ctx, sub.ID, inv.Subscription.ID, plan.GrantPoints, plan.PeriodDays)
+	return s.svc.ActivateSubscription(ctx, sub.ID, stripeSub.ID, plan.GrantPoints, plan.PeriodDays)
 }
 
 func (s *Server) respondServiceError(w http.ResponseWriter, err error) {
