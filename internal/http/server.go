@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"runtime/debug"
 	"strconv"
 	"time"
 
@@ -32,11 +35,47 @@ func NewServer(svc *services.Service, cfg config.Config) *Server {
 	return &Server{svc: svc, cfg: cfg, emailClient: emailClient}
 }
 
+// loggingRecoverer 自定义的 panic 恢复中间件，记录详细的错误信息
+func loggingRecoverer(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rvr := recover(); rvr != nil {
+				reqID := middleware.GetReqID(r.Context())
+				log.Printf("[ERROR] [%s] Panic recovered in %s %s: %v\n%s",
+					reqID, r.Method, r.URL.Path, rvr, debug.Stack())
+
+				if r.Header.Get("Connection") != "Upgrade" {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusInternalServerError)
+					errMsg := fmt.Sprintf("internal server error: %v", rvr)
+					_ = json.NewEncoder(w).Encode(ErrorResponse{Error: errMsg})
+				}
+			}
+		}()
+		next.ServeHTTP(w, r)
+	})
+}
+
+// requestLogger 记录请求日志的中间件
+func requestLogger(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		start := time.Now()
+		ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
+		defer func() {
+			reqID := middleware.GetReqID(r.Context())
+			log.Printf("[%s] %s %s %d %s",
+				reqID, r.Method, r.URL.Path, ww.Status(), time.Since(start))
+		}()
+		next.ServeHTTP(ww, r)
+	})
+}
+
 func (s *Server) Routes() http.Handler {
 	r := chi.NewRouter()
 	r.Use(middleware.RequestID)
 	r.Use(middleware.RealIP)
-	r.Use(middleware.Recoverer)
+	r.Use(loggingRecoverer)
+	r.Use(requestLogger)
 	r.Use(s.corsMiddleware)
 
 	// 所有 API 路由都在 /api 前缀下
@@ -354,46 +393,63 @@ type createSubscriptionCheckoutRequest struct {
 }
 
 func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http.Request) {
+	reqID := middleware.GetReqID(r.Context())
+	log.Printf("[INFO] [%s] Starting subscription checkout", reqID)
+
 	if s.cfg.StripeSecretKey == "" {
-		s.respondServiceError(w, services.ErrStripeNotConfigured)
+		log.Printf("[ERROR] [%s] Stripe not configured", reqID)
+		s.respondServiceErrorWithContext(w, r, services.ErrStripeNotConfigured, "stripe_not_configured")
 		return
 	}
 	var req createSubscriptionCheckoutRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, err)
+		log.Printf("[ERROR] [%s] Failed to decode request: %v", reqID, err)
+		respondErrorWithLog(w, r, http.StatusBadRequest, err, "decode_request")
 		return
 	}
+	log.Printf("[INFO] [%s] Checkout request: user_id=%d, plan_id=%d", reqID, req.UserID, req.PlanID)
+
 	if req.UserID == 0 || req.PlanID == 0 || req.SuccessURL == "" || req.CancelURL == "" {
-		respondError(w, http.StatusBadRequest, errors.New("user_id, plan_id, success_url, cancel_url are required"))
+		respondErrorWithLog(w, r, http.StatusBadRequest, errors.New("user_id, plan_id, success_url, cancel_url are required"), "validation")
 		return
 	}
 	// 权限验证：只能为自己创建订阅，管理员可以为任何人创建
 	if !canAccessUser(r.Context(), req.UserID) {
-		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		respondErrorWithLog(w, r, http.StatusForbidden, errors.New("access denied"), "access_denied")
 		return
 	}
 
 	plan, err := s.svc.GetPlanByID(r.Context(), req.PlanID)
 	if err != nil {
-		s.respondServiceError(w, err)
+		log.Printf("[ERROR] [%s] Failed to get plan %d: %v", reqID, req.PlanID, err)
+		s.respondServiceErrorWithContext(w, r, err, fmt.Sprintf("get_plan_%d", req.PlanID))
 		return
 	}
+	log.Printf("[INFO] [%s] Found plan: name=%s, price=%d cents", reqID, plan.Name, plan.PriceCents)
+
 	priceID, err := s.stripePriceForPlan(plan.Name)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, err)
+		log.Printf("[ERROR] [%s] Failed to get stripe price for plan %s: %v", reqID, plan.Name, err)
+		respondErrorWithLog(w, r, http.StatusBadRequest, err, fmt.Sprintf("stripe_price_for_%s", plan.Name))
 		return
 	}
+	log.Printf("[INFO] [%s] Stripe price ID: %s", reqID, priceID)
 
 	sub, err := s.svc.CreatePendingSubscription(r.Context(), req.UserID, plan.ID, plan.PeriodDays)
 	if err != nil {
-		s.respondServiceError(w, err)
+		log.Printf("[ERROR] [%s] Failed to create pending subscription: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "create_pending_subscription")
 		return
 	}
+	log.Printf("[INFO] [%s] Created pending subscription: id=%d", reqID, sub.ID)
+
 	order, err := s.svc.CreateSubscriptionOrder(r.Context(), req.UserID, sub.ID, plan.PriceCents, plan.GrantPoints)
 	if err != nil {
-		s.respondServiceError(w, err)
+		log.Printf("[ERROR] [%s] Failed to create subscription order: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "create_subscription_order")
 		return
 	}
+	log.Printf("[INFO] [%s] Created order: id=%d", reqID, order.ID)
 
 	stripe.Key = s.cfg.StripeSecretKey
 	params := &stripe.CheckoutSessionParams{
@@ -415,21 +471,36 @@ func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http
 		},
 	}
 
-	session, err := session.New(params)
+	log.Printf("[INFO] [%s] Creating Stripe checkout session...", reqID)
+	sess, err := session.New(params)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, err)
+		// 详细记录 Stripe 错误
+		var stripeErr *stripe.Error
+		if errors.As(err, &stripeErr) {
+			log.Printf("[ERROR] [%s] Stripe API error: type=%s, code=%s, message=%s, param=%s",
+				reqID, stripeErr.Type, stripeErr.Code, stripeErr.Msg, stripeErr.Param)
+			respondErrorWithLog(w, r, http.StatusBadRequest,
+				fmt.Errorf("stripe error: %s - %s", stripeErr.Code, stripeErr.Msg), "stripe_api")
+		} else {
+			log.Printf("[ERROR] [%s] Failed to create Stripe session: %v", reqID, err)
+			respondErrorWithLog(w, r, http.StatusInternalServerError, err, "stripe_session_create")
+		}
 		return
 	}
-	if err := s.svc.LinkOrderSession(r.Context(), order.ID, session.ID); err != nil {
-		s.respondServiceError(w, err)
+	log.Printf("[INFO] [%s] Stripe session created: id=%s", reqID, sess.ID)
+
+	if err := s.svc.LinkOrderSession(r.Context(), order.ID, sess.ID); err != nil {
+		log.Printf("[ERROR] [%s] Failed to link order session: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "link_order_session")
 		return
 	}
+	log.Printf("[INFO] [%s] Checkout session completed successfully", reqID)
 
 	respondJSON(w, http.StatusCreated, map[string]any{
 		"order_id":        order.ID,
 		"subscription_id": sub.ID,
-		"stripe_session":  session.ID,
-		"checkout_url":    session.URL,
+		"stripe_session":  sess.ID,
+		"checkout_url":    sess.URL,
 	})
 }
 
@@ -483,30 +554,39 @@ type createPrepaidCheckoutRequest struct {
 }
 
 func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Request) {
+	reqID := middleware.GetReqID(r.Context())
+	log.Printf("[INFO] [%s] Starting prepaid checkout", reqID)
+
 	if s.cfg.StripeSecretKey == "" {
-		s.respondServiceError(w, services.ErrStripeNotConfigured)
+		log.Printf("[ERROR] [%s] Stripe not configured", reqID)
+		s.respondServiceErrorWithContext(w, r, services.ErrStripeNotConfigured, "stripe_not_configured")
 		return
 	}
 	var req createPrepaidCheckoutRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		respondError(w, http.StatusBadRequest, err)
+		log.Printf("[ERROR] [%s] Failed to decode request: %v", reqID, err)
+		respondErrorWithLog(w, r, http.StatusBadRequest, err, "decode_request")
 		return
 	}
+	log.Printf("[INFO] [%s] Prepaid request: user_id=%d, amount=%d cents", reqID, req.UserID, req.AmountCents)
+
 	if req.UserID == 0 || req.AmountCents <= 0 || req.SuccessURL == "" || req.CancelURL == "" {
-		respondError(w, http.StatusBadRequest, errors.New("user_id, amount_cents, success_url, cancel_url are required"))
+		respondErrorWithLog(w, r, http.StatusBadRequest, errors.New("user_id, amount_cents, success_url, cancel_url are required"), "validation")
 		return
 	}
 	// 权限验证：只能为自己充值，管理员可以为任何人充值
 	if !canAccessUser(r.Context(), req.UserID) {
-		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		respondErrorWithLog(w, r, http.StatusForbidden, errors.New("access denied"), "access_denied")
 		return
 	}
 
 	order, err := s.svc.CreatePrepaidOrder(r.Context(), req.UserID, req.AmountCents)
 	if err != nil {
-		s.respondServiceError(w, err)
+		log.Printf("[ERROR] [%s] Failed to create prepaid order: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "create_prepaid_order")
 		return
 	}
+	log.Printf("[INFO] [%s] Created prepaid order: id=%d", reqID, order.ID)
 
 	stripe.Key = s.cfg.StripeSecretKey
 	params := &stripe.CheckoutSessionParams{
@@ -517,7 +597,7 @@ func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Requ
 		LineItems: []*stripe.CheckoutSessionLineItemParams{
 			{
 				PriceData: &stripe.CheckoutSessionLineItemPriceDataParams{
-					Currency: stripe.String(s.cfg.StripeCurrency),
+					Currency:   stripe.String(s.cfg.StripeCurrency),
 					UnitAmount: stripe.Int64(int64(req.AmountCents)),
 					ProductData: &stripe.CheckoutSessionLineItemPriceDataProductDataParams{
 						Name: stripe.String("Prepaid Points"),
@@ -531,19 +611,35 @@ func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Requ
 			"user_id":  strconv.FormatInt(req.UserID, 10),
 		},
 	}
-	session, err := session.New(params)
+
+	log.Printf("[INFO] [%s] Creating Stripe checkout session...", reqID)
+	sess, err := session.New(params)
 	if err != nil {
-		respondError(w, http.StatusBadRequest, err)
+		// 详细记录 Stripe 错误
+		var stripeErr *stripe.Error
+		if errors.As(err, &stripeErr) {
+			log.Printf("[ERROR] [%s] Stripe API error: type=%s, code=%s, message=%s, param=%s",
+				reqID, stripeErr.Type, stripeErr.Code, stripeErr.Msg, stripeErr.Param)
+			respondErrorWithLog(w, r, http.StatusBadRequest,
+				fmt.Errorf("stripe error: %s - %s", stripeErr.Code, stripeErr.Msg), "stripe_api")
+		} else {
+			log.Printf("[ERROR] [%s] Failed to create Stripe session: %v", reqID, err)
+			respondErrorWithLog(w, r, http.StatusInternalServerError, err, "stripe_session_create")
+		}
 		return
 	}
-	if err := s.svc.LinkOrderSession(r.Context(), order.ID, session.ID); err != nil {
-		s.respondServiceError(w, err)
+	log.Printf("[INFO] [%s] Stripe session created: id=%s", reqID, sess.ID)
+
+	if err := s.svc.LinkOrderSession(r.Context(), order.ID, sess.ID); err != nil {
+		log.Printf("[ERROR] [%s] Failed to link order session: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "link_order_session")
 		return
 	}
+	log.Printf("[INFO] [%s] Prepaid checkout completed successfully", reqID)
 	respondJSON(w, http.StatusCreated, map[string]any{
 		"order_id":       order.ID,
-		"stripe_session": session.ID,
-		"checkout_url":   session.URL,
+		"stripe_session": sess.ID,
+		"checkout_url":   sess.URL,
 	})
 }
 
@@ -735,6 +831,10 @@ func (s *Server) processInvoicePaid(ctx context.Context, inv *stripe.Invoice) er
 }
 
 func (s *Server) respondServiceError(w http.ResponseWriter, err error) {
+	s.respondServiceErrorWithContext(w, nil, err, "")
+}
+
+func (s *Server) respondServiceErrorWithContext(w http.ResponseWriter, r *http.Request, err error, context string) {
 	switch {
 	case errors.Is(err, services.ErrNotFound):
 		respondError(w, http.StatusNotFound, err)
@@ -761,7 +861,13 @@ func (s *Server) respondServiceError(w http.ResponseWriter, err error) {
 	case errors.Is(err, services.ErrUserDisabled):
 		respondError(w, http.StatusForbidden, err)
 	default:
-		respondError(w, http.StatusInternalServerError, err)
+		// 对于未知错误，记录详细日志
+		if r != nil {
+			respondErrorWithLog(w, r, http.StatusInternalServerError, err, context)
+		} else {
+			log.Printf("[ERROR] Internal server error: %v | Context: %s", err, context)
+			respondError(w, http.StatusInternalServerError, err)
+		}
 	}
 }
 
