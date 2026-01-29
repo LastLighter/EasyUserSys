@@ -29,7 +29,7 @@ type Plan struct {
 	Name        string
 	PeriodDays  int
 	PriceCents  int
-	GrantPoints int
+	GrantPoints float64
 	Active      bool
 }
 
@@ -49,8 +49,8 @@ type BalanceBucket struct {
 	ID              int64
 	UserID          int64
 	BucketType      string
-	TotalPoints     int
-	RemainingPoints int
+	TotalPoints     float64
+	RemainingPoints float64
 	ExpiresAt       *time.Time
 	CreatedAt       time.Time
 	UpdatedAt       time.Time
@@ -60,7 +60,7 @@ type UsageRecord struct {
 	ID         int64
 	UserID     int64
 	Units      int
-	CostPoints int
+	CostPoints float64
 	RequestID  string
 	RecordedAt time.Time
 }
@@ -69,7 +69,7 @@ type BillingLedger struct {
 	ID            int64
 	UserID        int64
 	BucketID      *int64
-	DeltaPoints   int
+	DeltaPoints   float64
 	Reason        string
 	ReferenceType string
 	ReferenceID   *int64
@@ -82,7 +82,7 @@ type Order struct {
 	OrderType              string
 	Status                 string
 	AmountCents            int
-	Points                 int
+	Points                 float64
 	SubscriptionID         *int64
 	StripeSessionID        *string // 可能为 NULL（创建后才关联）
 	StripePaymentIntentID  *string // 可能为 NULL（支付完成后才有）

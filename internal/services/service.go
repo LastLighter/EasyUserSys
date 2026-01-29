@@ -82,16 +82,17 @@ func (s *Service) CreateUser(ctx context.Context, systemCode, email, password st
 		return models.User{}, err
 	}
 	if s.config.FreeSignupPoints > 0 {
+		expiresAt := time.Now().UTC().Add(s.config.FreeSignupExpiry())
 		_, err = s.pool.Exec(ctx, `
-			INSERT INTO balance_buckets (user_id, bucket_type, total_points, remaining_points)
-			VALUES ($1, $2, $3, $3)`, user.ID, models.BucketFree, s.config.FreeSignupPoints)
+			INSERT INTO balance_buckets (user_id, system_code, bucket_type, total_points, remaining_points, expires_at)
+			VALUES ($1, $2, $3, $4, $4, $5)`, user.ID, systemCode, models.BucketFree, s.config.FreeSignupPoints, expiresAt)
 		if err != nil {
 			return models.User{}, err
 		}
 		_, err = s.pool.Exec(ctx, `
-			INSERT INTO billing_ledger (user_id, delta_points, reason, reference_type)
-			VALUES ($1, $2, $3, $4)`,
-			user.ID, s.config.FreeSignupPoints, "signup_bonus", "user")
+			INSERT INTO billing_ledger (user_id, system_code, delta_points, reason, reference_type)
+			VALUES ($1, $2, $3, $4, $5)`,
+			user.ID, systemCode, s.config.FreeSignupPoints, "signup_bonus", "user")
 		if err != nil {
 			return models.User{}, err
 		}
@@ -109,6 +110,15 @@ func (s *Service) GetUserByID(ctx context.Context, id int64) (models.User, error
 		return models.User{}, ErrNotFound
 	}
 	return user, err
+}
+
+func (s *Service) GetUserSystemCodeByID(ctx context.Context, id int64) (string, error) {
+	var systemCode string
+	err := s.pool.QueryRow(ctx, `SELECT system_code FROM users WHERE id = $1`, id).Scan(&systemCode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
+	return systemCode, err
 }
 
 func (s *Service) GetUserByEmail(ctx context.Context, systemCode, email string) (models.User, error) {
@@ -146,8 +156,8 @@ func (s *Service) CreateAPIKey(ctx context.Context, userID int64) (string, model
 	}
 	var apiKey models.APIKey
 	err = s.pool.QueryRow(ctx, `
-		INSERT INTO api_keys (user_id, key_hash, key_prefix, status)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO api_keys (user_id, system_code, key_hash, key_prefix, status)
+		SELECT id, system_code, $2, $3, $4 FROM users WHERE id = $1
 		RETURNING id, user_id, key_hash, key_prefix, status, created_at, revoked_at`,
 		userID, hash, prefix, models.APIKeyStatusActive,
 	).Scan(&apiKey.ID, &apiKey.UserID, &apiKey.KeyHash, &apiKey.KeyPrefix, &apiKey.Status, &apiKey.CreatedAt, &apiKey.RevokedAt)
@@ -224,15 +234,15 @@ func (s *Service) CreatePendingSubscription(ctx context.Context, userID, planID 
 	now := time.Now().UTC()
 	sub := models.Subscription{}
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO subscriptions (user_id, plan_id, status, started_at, ends_at)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO subscriptions (user_id, system_code, plan_id, status, started_at, ends_at)
+		SELECT id, system_code, $2, $3, $4, $5 FROM users WHERE id = $1
 		RETURNING id, user_id, plan_id, status, started_at, ends_at, stripe_subscription_id, created_at, updated_at`,
 		userID, planID, models.SubscriptionPending, now, now.Add(time.Duration(periodDays)*24*time.Hour),
 	).Scan(&sub.ID, &sub.UserID, &sub.PlanID, &sub.Status, &sub.StartedAt, &sub.EndsAt, &sub.StripeSubscriptionID, &sub.CreatedAt, &sub.UpdatedAt)
 	return sub, err
 }
 
-func (s *Service) ActivateSubscription(ctx context.Context, subscriptionID int64, stripeSubscriptionID string, grantPoints int, periodDays int) error {
+func (s *Service) ActivateSubscription(ctx context.Context, subscriptionID int64, stripeSubscriptionID string, grantPoints float64, periodDays int) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return err
@@ -254,16 +264,16 @@ func (s *Service) ActivateSubscription(ctx context.Context, subscriptionID int64
 
 	var bucketID int64
 	err = tx.QueryRow(ctx, `
-		INSERT INTO balance_buckets (user_id, bucket_type, total_points, remaining_points, expires_at)
-		SELECT user_id, $1, $2, $2, $3 FROM subscriptions WHERE id = $4
+		INSERT INTO balance_buckets (user_id, system_code, bucket_type, total_points, remaining_points, expires_at)
+		SELECT user_id, system_code, $1, $2, $2, $3 FROM subscriptions WHERE id = $4
 		RETURNING id`,
 		models.BucketSubscription, grantPoints, endsAt, subscriptionID).Scan(&bucketID)
 	if err != nil {
 		return err
 	}
 	_, err = tx.Exec(ctx, `
-		INSERT INTO billing_ledger (user_id, bucket_id, delta_points, reason, reference_type, reference_id)
-		SELECT user_id, $1, $2, $3, $4, id FROM subscriptions WHERE id = $5`,
+		INSERT INTO billing_ledger (user_id, system_code, bucket_id, delta_points, reason, reference_type, reference_id)
+		SELECT user_id, system_code, $1, $2, $3, $4, id FROM subscriptions WHERE id = $5`,
 		bucketID, grantPoints, "subscription_grant", "subscription", subscriptionID)
 	if err != nil {
 		return err
@@ -327,7 +337,7 @@ func (s *Service) ReportUsage(ctx context.Context, userID int64, units int, requ
 	if userID == 0 || units <= 0 || requestID == "" {
 		return models.UsageRecord{}, ErrInvalidRequest
 	}
-	costPoints := units * s.config.CostPerUnit
+	costPoints := float64(units) * s.config.CostPerUnit
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return models.UsageRecord{}, err
@@ -350,8 +360,8 @@ func (s *Service) ReportUsage(ctx context.Context, userID int64, units int, requ
 
 	usage := models.UsageRecord{}
 	err = tx.QueryRow(ctx, `
-		INSERT INTO usage_records (user_id, units, cost_points, request_id)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO usage_records (user_id, system_code, units, cost_points, request_id)
+		SELECT id, system_code, $2, $3, $4 FROM users WHERE id = $1
 		RETURNING id, user_id, units, cost_points, request_id, recorded_at`,
 		userID, units, costPoints, requestID).Scan(&usage.ID, &usage.UserID, &usage.Units, &usage.CostPoints, &usage.RequestID, &usage.RecordedAt)
 	if err != nil {
@@ -367,14 +377,14 @@ func (s *Service) ReportUsage(ctx context.Context, userID int64, units int, requ
 	}
 	remaining := costPoints
 	for i := range buckets {
-		if remaining == 0 {
+		if remaining <= 0 {
 			break
 		}
 		available := buckets[i].RemainingPoints
-		if available == 0 {
+		if available <= 0 {
 			continue
 		}
-		toDeduct := minInt(available, remaining)
+		toDeduct := minFloat(available, remaining)
 		remaining -= toDeduct
 		newRemaining := available - toDeduct
 		_, err = tx.Exec(ctx, `
@@ -385,9 +395,9 @@ func (s *Service) ReportUsage(ctx context.Context, userID int64, units int, requ
 			return models.UsageRecord{}, err
 		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO billing_ledger (user_id, bucket_id, delta_points, reason, reference_type, reference_id)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			userID, buckets[i].ID, -toDeduct, "usage_deduction", "usage", usage.ID)
+			INSERT INTO billing_ledger (user_id, system_code, bucket_id, delta_points, reason, reference_type, reference_id)
+			SELECT id, system_code, $1, $2, $3, $4, $5 FROM users WHERE id = $6`,
+			buckets[i].ID, -toDeduct, "usage_deduction", "usage", usage.ID, userID)
 		if err != nil {
 			return models.UsageRecord{}, err
 		}
@@ -458,11 +468,11 @@ func (s *Service) CreatePrepaidOrder(ctx context.Context, userID int64, amountCe
 	if userID == 0 || amountCents <= 0 {
 		return models.Order{}, ErrInvalidRequest
 	}
-	points := amountCents / 10
+	points := float64(amountCents) / 10.0
 	var order models.Order
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO orders (user_id, order_type, status, amount_cents, points)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO orders (user_id, system_code, order_type, status, amount_cents, points)
+		SELECT id, system_code, $2, $3, $4, $5 FROM users WHERE id = $1
 		RETURNING id, user_id, order_type, status, amount_cents, points, subscription_id,
 			stripe_session_id, stripe_payment_intent_id, stripe_subscription_id, created_at, updated_at`,
 		userID, models.OrderTypePrepaid, models.OrderStatusPending, amountCents, points,
@@ -494,16 +504,16 @@ func (s *Service) MarkOrderPaid(ctx context.Context, orderID int64, stripeSessio
 		expiresAt := time.Now().UTC().Add(s.config.PrepaidExpiry())
 		var bucketID int64
 		err = tx.QueryRow(ctx, `
-			INSERT INTO balance_buckets (user_id, bucket_type, total_points, remaining_points, expires_at)
-			VALUES ($1, $2, $3, $3, $4)
-			RETURNING id`, order.UserID, models.BucketPrepaid, order.Points, expiresAt).Scan(&bucketID)
+			INSERT INTO balance_buckets (user_id, system_code, bucket_type, total_points, remaining_points, expires_at)
+			SELECT user_id, system_code, $2, $3, $3, $4 FROM orders WHERE id = $1
+			RETURNING id`, order.ID, models.BucketPrepaid, order.Points, expiresAt).Scan(&bucketID)
 		if err != nil {
 			return models.Order{}, err
 		}
 		_, err = tx.Exec(ctx, `
-			INSERT INTO billing_ledger (user_id, bucket_id, delta_points, reason, reference_type, reference_id)
-			VALUES ($1, $2, $3, $4, $5, $6)`,
-			order.UserID, bucketID, order.Points, "prepaid_grant", "order", order.ID)
+			INSERT INTO billing_ledger (user_id, system_code, bucket_id, delta_points, reason, reference_type, reference_id)
+			SELECT user_id, system_code, $1, $2, $3, $4, $5 FROM orders WHERE id = $6`,
+			bucketID, order.Points, "prepaid_grant", "order", order.ID, order.ID)
 		if err != nil {
 			return models.Order{}, err
 		}
@@ -578,21 +588,28 @@ func minInt(a, b int) int {
 	return b
 }
 
-func (s *Service) GrantSubscriptionPoints(ctx context.Context, userID int64, points int, expiresAt time.Time, subscriptionID int64) error {
+func minFloat(a, b float64) float64 {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (s *Service) GrantSubscriptionPoints(ctx context.Context, userID int64, points float64, expiresAt time.Time, subscriptionID int64) error {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO balance_buckets (user_id, bucket_type, total_points, remaining_points, expires_at)
-		VALUES ($1, $2, $3, $3, $4)`, userID, models.BucketSubscription, points, expiresAt)
+		INSERT INTO balance_buckets (user_id, system_code, bucket_type, total_points, remaining_points, expires_at)
+		SELECT id, system_code, $2, $3, $3, $4 FROM users WHERE id = $1`, userID, models.BucketSubscription, points, expiresAt)
 	if err != nil {
 		return err
 	}
 	_, err = s.pool.Exec(ctx, `
-		INSERT INTO billing_ledger (user_id, delta_points, reason, reference_type, reference_id)
-		VALUES ($1, $2, $3, $4, $5)`,
+		INSERT INTO billing_ledger (user_id, system_code, delta_points, reason, reference_type, reference_id)
+		SELECT id, system_code, $2, $3, $4, $5 FROM users WHERE id = $1`,
 		userID, points, "subscription_grant", "subscription", subscriptionID)
 	return err
 }
 
-func (s *Service) UpdateSubscriptionFromStripe(ctx context.Context, subscriptionID int64, stripeSubscriptionID string, periodDays, grantPoints int) error {
+func (s *Service) UpdateSubscriptionFromStripe(ctx context.Context, subscriptionID int64, stripeSubscriptionID string, periodDays int, grantPoints float64) error {
 	now := time.Now().UTC()
 	endsAt := now.Add(time.Duration(periodDays) * 24 * time.Hour)
 	ct, err := s.pool.Exec(ctx, `
@@ -621,11 +638,11 @@ func (s *Service) subscriptionUser(ctx context.Context, subscriptionID int64) (i
 	return userID, nil
 }
 
-func (s *Service) CreateSubscriptionOrder(ctx context.Context, userID int64, subscriptionID int64, amountCents int, points int) (models.Order, error) {
+func (s *Service) CreateSubscriptionOrder(ctx context.Context, userID int64, subscriptionID int64, amountCents int, points float64) (models.Order, error) {
 	var order models.Order
 	err := s.pool.QueryRow(ctx, `
-		INSERT INTO orders (user_id, order_type, status, amount_cents, points, subscription_id)
-		VALUES ($1, $2, $3, $4, $5, $6)
+		INSERT INTO orders (user_id, system_code, order_type, status, amount_cents, points, subscription_id)
+		SELECT id, system_code, $2, $3, $4, $5, $6 FROM users WHERE id = $1
 		RETURNING id, user_id, order_type, status, amount_cents, points, subscription_id,
 			stripe_session_id, stripe_payment_intent_id, stripe_subscription_id, created_at, updated_at`,
 		userID, models.OrderTypeSubscription, models.OrderStatusPending, amountCents, points, subscriptionID,
@@ -657,8 +674,8 @@ func (s *Service) LinkOrderSession(ctx context.Context, orderID int64, sessionID
 	return nil
 }
 
-func (s *Service) StringifyPoints(points int) string {
-	return fmt.Sprintf("%d", points)
+func (s *Service) StringifyPoints(points float64) string {
+	return fmt.Sprintf("%.2f", points)
 }
 
 // AuthenticateUser 验证用户凭证
@@ -706,8 +723,8 @@ type ListUsersOptions struct {
 // UserWithBalance 包含余额信息的用户
 type UserWithBalance struct {
 	models.User
-	TotalBalance     int `json:"total_balance"`               // 总剩余积分
-	BalanceBuckets   []models.BalanceBucket `json:"balance_buckets,omitempty"` // 详细的积分桶信息
+	TotalBalance   float64                `json:"total_balance"`               // 总剩余积分
+	BalanceBuckets []models.BalanceBucket `json:"balance_buckets,omitempty"` // 详细的积分桶信息
 }
 
 // ListUsers 分页列出所有用户（管理员功能）
@@ -876,44 +893,74 @@ type Stats struct {
 }
 
 // GetStats 获取系统统计数据
-func (s *Service) GetStats(ctx context.Context, from, to time.Time) (Stats, error) {
+func (s *Service) GetStats(ctx context.Context, from, to time.Time, systemCode string) (Stats, error) {
 	var stats Stats
 
 	// 总用户数
-	err := s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&stats.TotalUsers)
+	var err error
+	if systemCode != "" {
+		err = s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users WHERE system_code = $1`, systemCode).Scan(&stats.TotalUsers)
+	} else {
+		err = s.pool.QueryRow(ctx, `SELECT COUNT(*) FROM users`).Scan(&stats.TotalUsers)
+	}
 	if err != nil {
 		return Stats{}, err
 	}
 
 	// 活跃订阅数
-	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM subscriptions
-		WHERE status = $1 AND ends_at > NOW()`, models.SubscriptionActive).Scan(&stats.ActiveSubscriptions)
+	if systemCode != "" {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM subscriptions
+			WHERE status = $1 AND ends_at > NOW() AND system_code = $2`, models.SubscriptionActive, systemCode).Scan(&stats.ActiveSubscriptions)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM subscriptions
+			WHERE status = $1 AND ends_at > NOW()`, models.SubscriptionActive).Scan(&stats.ActiveSubscriptions)
+	}
 	if err != nil {
 		return Stats{}, err
 	}
 
 	// 总收入（所有已支付订单）
-	err = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(amount_cents), 0) FROM orders
-		WHERE status = $1`, models.OrderStatusPaid).Scan(&stats.TotalRevenueCents)
+	if systemCode != "" {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COALESCE(SUM(amount_cents), 0) FROM orders
+			WHERE status = $1 AND system_code = $2`, models.OrderStatusPaid, systemCode).Scan(&stats.TotalRevenueCents)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COALESCE(SUM(amount_cents), 0) FROM orders
+			WHERE status = $1`, models.OrderStatusPaid).Scan(&stats.TotalRevenueCents)
+	}
 	if err != nil {
 		return Stats{}, err
 	}
 
 	// 指定时段收入
-	err = s.pool.QueryRow(ctx, `
-		SELECT COALESCE(SUM(amount_cents), 0) FROM orders
-		WHERE status = $1 AND created_at >= $2 AND created_at <= $3`,
-		models.OrderStatusPaid, from, to).Scan(&stats.PeriodRevenueCents)
+	if systemCode != "" {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COALESCE(SUM(amount_cents), 0) FROM orders
+			WHERE status = $1 AND system_code = $2 AND created_at >= $3 AND created_at <= $4`,
+			models.OrderStatusPaid, systemCode, from, to).Scan(&stats.PeriodRevenueCents)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COALESCE(SUM(amount_cents), 0) FROM orders
+			WHERE status = $1 AND created_at >= $2 AND created_at <= $3`,
+			models.OrderStatusPaid, from, to).Scan(&stats.PeriodRevenueCents)
+	}
 	if err != nil {
 		return Stats{}, err
 	}
 
 	// 时段内新增用户
-	err = s.pool.QueryRow(ctx, `
-		SELECT COUNT(*) FROM users
-		WHERE created_at >= $1 AND created_at <= $2`, from, to).Scan(&stats.NewUsersInPeriod)
+	if systemCode != "" {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM users
+			WHERE system_code = $1 AND created_at >= $2 AND created_at <= $3`, systemCode, from, to).Scan(&stats.NewUsersInPeriod)
+	} else {
+		err = s.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM users
+			WHERE created_at >= $1 AND created_at <= $2`, from, to).Scan(&stats.NewUsersInPeriod)
+	}
 	if err != nil {
 		return Stats{}, err
 	}
@@ -989,9 +1036,10 @@ func (s *Service) GetOrCreateUserByGoogleID(ctx context.Context, systemCode, goo
 
 	// 赠送免费积分
 	if s.config.FreeSignupPoints > 0 {
+		expiresAt := time.Now().UTC().Add(s.config.FreeSignupExpiry())
 		_, err = s.pool.Exec(ctx, `
-			INSERT INTO balance_buckets (user_id, bucket_type, total_points, remaining_points)
-			VALUES ($1, $2, $3, $3)`, user.ID, models.BucketFree, s.config.FreeSignupPoints)
+			INSERT INTO balance_buckets (user_id, bucket_type, total_points, remaining_points, expires_at)
+			VALUES ($1, $2, $3, $3, $4)`, user.ID, models.BucketFree, s.config.FreeSignupPoints, expiresAt)
 		if err != nil {
 			return models.User{}, false, err
 		}

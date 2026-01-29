@@ -386,7 +386,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 
 `POST /api/users` **公开**
 
-创建新用户（注册）。新用户会自动获得免费注册积分（默认 10 点）。
+创建新用户（注册）。新用户会自动获得免费注册积分（默认 5 点，每月刷新）。
 
 **请求**：
 ```json
@@ -526,7 +526,7 @@ RESEND_FROM_EMAIL=noreply@yourdomain.com
 **积分桶类型**：
 | 类型 | 说明 |
 |------|------|
-| `free` | 免费注册赠送积分，无过期时间 |
+| `free` | 免费注册赠送积分，有过期时间（默认30天，每月刷新） |
 | `subscription` | 订阅发放积分，周期内有效 |
 | `prepaid` | 预充值购买积分，有过期时间 |
 
@@ -1198,7 +1198,7 @@ curl -X GET "http://localhost:8080/api/admin/users?system_code=demo&include_bala
 **积分桶类型**：
 | 类型 | 说明 |
 |------|------|
-| `free` | 免费注册赠送积分，无过期时间 |
+| `free` | 免费注册赠送积分，有过期时间（默认30天，每月刷新） |
 | `subscription` | 订阅发放积分，周期内有效 |
 | `prepaid` | 预充值购买积分，有过期时间 |
 
@@ -1484,6 +1484,13 @@ async function getUserBalance(userId) {
    - 验证码有效期默认 10 分钟（可配置）
    - 同一邮箱每分钟只能发送 1 次验证码
    - 找回密码时需要用户已注册
+
+7. **多租户数据隔离**
+   - 所有用户、订阅、订单、余额、用量等数据均按 `system_code` 隔离
+   - JWT Token 包含 `system_code` 字段，用于后续请求的权限校验
+   - 管理员仅能访问同一 `system_code` 下的用户和数据
+   - 管理员统计接口（`/api/admin/stats`）自动按当前用户的 `system_code` 过滤
+   - 管理员列表用户接口（`/api/admin/users`）若不传 `system_code` 则默认使用当前用户所属系统
 
 ### 找回密码示例代码
 

@@ -18,26 +18,29 @@ const (
 	contextKeyUserID contextKey = "user_id"
 	contextKeyEmail  contextKey = "email"
 	contextKeyRole   contextKey = "role"
+	contextKeySystem contextKey = "system_code"
 )
 
 type JWTClaims struct {
-	UserID int64  `json:"user_id"`
-	Email  string `json:"email"`
-	Role   string `json:"role"`
+	UserID     int64  `json:"user_id"`
+	Email      string `json:"email"`
+	Role       string `json:"role"`
+	SystemCode string `json:"system_code"`
 	jwt.RegisteredClaims
 }
 
 // generateJWT 生成 JWT Token
-func (s *Server) generateJWT(userID int64, email string, role string) (string, error) {
+func (s *Server) generateJWT(userID int64, email string, role string, systemCode string) (string, error) {
 	if s.cfg.JWTSecretKey == "" {
 		return "", errors.New("JWT secret key not configured")
 	}
 
 	expiryDuration := time.Duration(s.cfg.JWTExpiryHours) * time.Hour
 	claims := JWTClaims{
-		UserID: userID,
-		Email:  email,
-		Role:   role,
+		UserID:     userID,
+		Email:      email,
+		Role:       role,
+		SystemCode: systemCode,
 		RegisteredClaims: jwt.RegisteredClaims{
 			ExpiresAt: jwt.NewNumericDate(time.Now().Add(expiryDuration)),
 			IssuedAt:  jwt.NewNumericDate(time.Now()),
@@ -93,6 +96,7 @@ func (s *Server) jwtMiddleware(next http.Handler) http.Handler {
 		ctx = context.WithValue(ctx, contextKeyUserID, claims.UserID)
 		ctx = context.WithValue(ctx, contextKeyEmail, claims.Email)
 		ctx = context.WithValue(ctx, contextKeyRole, claims.Role)
+	ctx = context.WithValue(ctx, contextKeySystem, claims.SystemCode)
 
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
@@ -134,16 +138,47 @@ func getRoleFromContext(ctx context.Context) string {
 	return ""
 }
 
+// getSystemCodeFromContext 从 context 获取系统标识
+func getSystemCodeFromContext(ctx context.Context) string {
+	if systemCode, ok := ctx.Value(contextKeySystem).(string); ok {
+		return systemCode
+	}
+	return ""
+}
+
 // isAdmin 检查当前用户是否为管理员
 func isAdmin(ctx context.Context) bool {
 	return getRoleFromContext(ctx) == models.UserRoleAdmin
 }
 
-// canAccessUser 检查当前用户是否可以访问目标用户的资源
-// 管理员可以访问任何用户，普通用户只能访问自己
-func canAccessUser(ctx context.Context, targetUserID int64) bool {
-	if isAdmin(ctx) {
-		return true
+// resolveSystemCode 获取当前用户的系统标识（优先从 JWT 读取）
+func (s *Server) resolveSystemCode(ctx context.Context) (string, error) {
+	if systemCode := getSystemCodeFromContext(ctx); systemCode != "" {
+		return systemCode, nil
 	}
-	return getUserIDFromContext(ctx) == targetUserID
+	userID := getUserIDFromContext(ctx)
+	if userID == 0 {
+		return "", nil
+	}
+	return s.svc.GetUserSystemCodeByID(ctx, userID)
+}
+
+// canAccessUser 检查当前用户是否可以访问目标用户的资源
+// 管理员仅允许访问同一 system_code 的用户资源
+func (s *Server) canAccessUser(ctx context.Context, targetUserID int64) (bool, error) {
+	if !isAdmin(ctx) {
+		return getUserIDFromContext(ctx) == targetUserID, nil
+	}
+	targetSystemCode, err := s.svc.GetUserSystemCodeByID(ctx, targetUserID)
+	if err != nil {
+		return false, err
+	}
+	requesterSystemCode, err := s.resolveSystemCode(ctx)
+	if err != nil {
+		return false, err
+	}
+	if requesterSystemCode == "" || targetSystemCode == "" {
+		return true, nil
+	}
+	return requesterSystemCode == targetSystemCode, nil
 }

@@ -10,15 +10,16 @@ import (
 type Config struct {
 	DatabaseURL                 string
 	ServerAddr                  string
-	CostPerUnit                 int
-	FreeSignupPoints            int
+	CostPerUnit                 float64
+	FreeSignupPoints            float64
+	FreeSignupExpiryDays        int // 免费积分过期天数，默认30天（每月刷新）
 	StripeSecretKey             string
 	StripeWebhookSecret         string
 	StripePriceMonthly          string
 	StripePriceQuarterly        string
 	StripeCurrency              string
-	SubscriptionMonthlyPoints   int
-	SubscriptionQuarterlyPoints int
+	SubscriptionMonthlyPoints   float64
+	SubscriptionQuarterlyPoints float64
 	PrepaidExpiryDays           int
 	JWTSecretKey                string
 	JWTExpiryHours              int
@@ -72,15 +73,16 @@ func Load() Config {
 	return Config{
 		DatabaseURL:                   env("DATABASE_URL", "postgres://postgres:postgres@localhost:5432/easyusersys?sslmode=disable"),
 		ServerAddr:                    env("SERVER_ADDR", ":8080"),
-		CostPerUnit:                   envInt("COST_PER_UNIT", 1),
-		FreeSignupPoints:              envInt("FREE_SIGNUP_POINTS", 10),
+		CostPerUnit:                   envFloat("COST_PER_UNIT", 1),
+		FreeSignupPoints:              envFloat("FREE_SIGNUP_POINTS", 5),
+		FreeSignupExpiryDays:          envInt("FREE_SIGNUP_EXPIRY_DAYS", 30),
 		StripeSecretKey:               env("STRIPE_SECRET_KEY", ""),
 		StripeWebhookSecret:           env("STRIPE_WEBHOOK_SECRET", ""),
 		StripePriceMonthly:            env("STRIPE_PRICE_MONTHLY", ""),
 		StripePriceQuarterly:          env("STRIPE_PRICE_QUARTERLY", ""),
 		StripeCurrency:                env("STRIPE_CURRENCY", "usd"),
-		SubscriptionMonthlyPoints:     envInt("SUBSCRIPTION_MONTHLY_POINTS", 200),
-		SubscriptionQuarterlyPoints:   envInt("SUBSCRIPTION_QUARTERLY_POINTS", 600),
+		SubscriptionMonthlyPoints:     envFloat("SUBSCRIPTION_MONTHLY_POINTS", 200),
+		SubscriptionQuarterlyPoints:   envFloat("SUBSCRIPTION_QUARTERLY_POINTS", 600),
 		PrepaidExpiryDays:             envInt("PREPAID_EXPIRY_DAYS", 30),
 		JWTSecretKey:                  env("JWT_SECRET_KEY", ""),
 		JWTExpiryHours:                envInt("JWT_EXPIRY_HOURS", 168),
@@ -112,6 +114,15 @@ func envInt(key string, def int) int {
 	return def
 }
 
+func envFloat(key string, def float64) float64 {
+	if v := os.Getenv(key); v != "" {
+		if parsed, err := strconv.ParseFloat(v, 64); err == nil {
+			return parsed
+		}
+	}
+	return def
+}
+
 func parseGoogleOAuthConfigs(raw string) map[string]GoogleOAuthConfig {
 	if raw == "" {
 		return nil
@@ -136,6 +147,10 @@ func parseResendEmailConfigs(raw string) map[string]ResendEmailConfig {
 
 func (c Config) PrepaidExpiry() time.Duration {
 	return time.Duration(c.PrepaidExpiryDays) * 24 * time.Hour
+}
+
+func (c Config) FreeSignupExpiry() time.Duration {
+	return time.Duration(c.FreeSignupExpiryDays) * 24 * time.Hour
 }
 
 func (c Config) VerificationCodeExpiry() time.Duration {

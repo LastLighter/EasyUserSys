@@ -30,7 +30,8 @@ cp env.example .env
 DATABASE_URL=postgres://postgres:postgres@localhost:5432/easyusersys?sslmode=disable
 SERVER_ADDR=:8080
 COST_PER_UNIT=1
-FREE_SIGNUP_POINTS=10
+FREE_SIGNUP_POINTS=5
+FREE_SIGNUP_EXPIRY_DAYS=30
 PREPAID_EXPIRY_DAYS=30
 STRIPE_SECRET_KEY=sk_test_xxx
 STRIPE_WEBHOOK_SECRET=whsec_xxx
@@ -54,7 +55,8 @@ USAGE_API_KEY=your-usage-api-key-for-internal-services
 setx DATABASE_URL "postgres://postgres:postgres@localhost:5432/easyusersys?sslmode=disable"
 setx SERVER_ADDR ":8080"
 setx COST_PER_UNIT "1"
-setx FREE_SIGNUP_POINTS "10"
+setx FREE_SIGNUP_POINTS "5"
+setx FREE_SIGNUP_EXPIRY_DAYS "30"
 setx PREPAID_EXPIRY_DAYS "30"
 setx STRIPE_SECRET_KEY "sk_test_xxx"
 setx STRIPE_WEBHOOK_SECRET "whsec_xxx"
@@ -69,9 +71,10 @@ setx USAGE_API_KEY "your-usage-api-key-for-internal-services"
 ```
 
 说明：
-- `COST_PER_UNIT` 为每次用量扣除积分（默认 1）。
-- `FREE_SIGNUP_POINTS` 为注册赠送积分（默认 10）。
-- `SUBSCRIPTION_*_POINTS` 为订阅发放积分额度。
+- `COST_PER_UNIT` 为每次用量扣除积分（默认 1），支持浮点数用于按量计费。
+- `FREE_SIGNUP_POINTS` 为注册赠送积分（默认 5），支持浮点数。
+- `FREE_SIGNUP_EXPIRY_DAYS` 为免费积分过期天数（默认 30 天，即每月刷新）。
+- `SUBSCRIPTION_*_POINTS` 为订阅发放积分额度，支持浮点数。
 - `JWT_SECRET_KEY` **必须配置**，用于签名 JWT Token，建议使用至少 32 字符的随机字符串。
 - `JWT_EXPIRY_HOURS` Token 有效期，默认 168 小时（7 天）。
 - `USAGE_API_KEY` 用量上报接口的服务间认证密钥，供内部微服务调用。
@@ -85,6 +88,11 @@ psql "%DATABASE_URL%" -f migrations/0001_init.sql
 psql "%DATABASE_URL%" -f migrations/0002_add_order_subscription_id.sql
 psql "%DATABASE_URL%" -f migrations/0003_add_user_password.sql
 psql "%DATABASE_URL%" -f migrations/0004_add_user_role.sql
+psql "%DATABASE_URL%" -f migrations/0005_add_user_google_id.sql
+psql "%DATABASE_URL%" -f migrations/0006_add_user_system_code.sql
+psql "%DATABASE_URL%" -f migrations/0007_add_verification_codes.sql
+psql "%DATABASE_URL%" -f migrations/0008_points_to_float.sql
+psql "%DATABASE_URL%" -f migrations/0009_add_system_code_to_finance_tables.sql
 ```
 
 如果本地没有 `psql`，可以用 Python 脚本（需要安装依赖）：

@@ -211,7 +211,7 @@ func (s *Server) handleGoogleCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 生成 JWT Token
-	jwtToken, err := s.generateJWT(user.ID, user.Email, user.Role)
+	jwtToken, err := s.generateJWT(user.ID, user.Email, user.Role, user.SystemCode)
 	if err != nil {
 		redirectWithError("token_generation_failed")
 		return

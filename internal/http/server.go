@@ -188,7 +188,7 @@ func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := s.generateJWT(user.ID, user.Email, user.Role)
+	token, err := s.generateJWT(user.ID, user.Email, user.Role, user.SystemCode)
 	if err != nil {
 		respondError(w, http.StatusInternalServerError, err)
 		return
@@ -236,7 +236,12 @@ func (s *Server) handleGetUser(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能查看自己的信息，管理员可以查看任何人
-	if !canAccessUser(r.Context(), id) {
+	allowed, err := s.canAccessUser(r.Context(), id)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -278,6 +283,15 @@ func (s *Server) handleUpdateUserStatus(w http.ResponseWriter, r *http.Request) 
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	allowed, err := s.canAccessUser(r.Context(), id)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
 	var req updateUserStatusRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		respondError(w, http.StatusBadRequest, err)
@@ -301,7 +315,12 @@ func (s *Server) handleListBalances(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能查看自己的余额，管理员可以查看任何人
-	if !canAccessUser(r.Context(), userID) {
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -320,7 +339,12 @@ func (s *Server) handleCreateAPIKey(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能为自己创建 API Key，管理员可以为任何人创建
-	if !canAccessUser(r.Context(), userID) {
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -342,7 +366,12 @@ func (s *Server) handleListAPIKeys(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能查看自己的 API Keys，管理员可以查看任何人
-	if !canAccessUser(r.Context(), userID) {
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -366,7 +395,12 @@ func (s *Server) handleRevokeAPIKey(w http.ResponseWriter, r *http.Request) {
 		s.respondServiceError(w, err)
 		return
 	}
-	if !canAccessUser(r.Context(), apiKey.UserID) {
+	allowed, err := s.canAccessUser(r.Context(), apiKey.UserID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -415,7 +449,12 @@ func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http
 		return
 	}
 	// 权限验证：只能为自己创建订阅，管理员可以为任何人创建
-	if !canAccessUser(r.Context(), req.UserID) {
+	allowed, err := s.canAccessUser(r.Context(), req.UserID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondErrorWithLog(w, r, http.StatusForbidden, errors.New("access denied"), "access_denied")
 		return
 	}
@@ -452,6 +491,13 @@ func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http
 	}
 	log.Printf("[INFO] [%s] Created order: id=%d", reqID, order.ID)
 
+	systemCode, err := s.svc.GetUserSystemCodeByID(r.Context(), req.UserID)
+	if err != nil {
+		log.Printf("[ERROR] [%s] Failed to get user system_code: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "get_user_system_code")
+		return
+	}
+
 	// 替换 URL 中的占位符
 	orderIDStr := strconv.FormatInt(order.ID, 10)
 	successURL := strings.Replace(req.SuccessURL, "{order_id}", orderIDStr, -1)
@@ -474,6 +520,7 @@ func (s *Server) handleCreateSubscriptionCheckout(w http.ResponseWriter, r *http
 			"subscription_id": strconv.FormatInt(sub.ID, 10),
 			"user_id":         strconv.FormatInt(req.UserID, 10),
 			"plan_id":         strconv.FormatInt(plan.ID, 10),
+			"system_code":     systemCode,
 		},
 	}
 
@@ -522,7 +569,12 @@ func (s *Server) handleCancelSubscription(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// 权限验证：只能取消自己的订阅，管理员可以取消任何人的
-	if !canAccessUser(r.Context(), sub.UserID) {
+	allowed, err := s.canAccessUser(r.Context(), sub.UserID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -545,7 +597,12 @@ func (s *Server) handleGetSubscription(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能查看自己的订阅，管理员可以查看任何人的
-	if !canAccessUser(r.Context(), sub.UserID) {
+	allowed, err := s.canAccessUser(r.Context(), sub.UserID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -581,7 +638,12 @@ func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	// 权限验证：只能为自己充值，管理员可以为任何人充值
-	if !canAccessUser(r.Context(), req.UserID) {
+	allowed, err := s.canAccessUser(r.Context(), req.UserID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondErrorWithLog(w, r, http.StatusForbidden, errors.New("access denied"), "access_denied")
 		return
 	}
@@ -593,6 +655,13 @@ func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	log.Printf("[INFO] [%s] Created prepaid order: id=%d", reqID, order.ID)
+
+	systemCode, err := s.svc.GetUserSystemCodeByID(r.Context(), req.UserID)
+	if err != nil {
+		log.Printf("[ERROR] [%s] Failed to get user system_code: %v", reqID, err)
+		s.respondServiceErrorWithContext(w, r, err, "get_user_system_code")
+		return
+	}
 
 	// 替换 URL 中的占位符
 	orderIDStr := strconv.FormatInt(order.ID, 10)
@@ -618,8 +687,9 @@ func (s *Server) handleCreatePrepaidCheckout(w http.ResponseWriter, r *http.Requ
 			},
 		},
 		Metadata: map[string]string{
-			"order_id": strconv.FormatInt(order.ID, 10),
-			"user_id":  strconv.FormatInt(req.UserID, 10),
+			"order_id":    strconv.FormatInt(order.ID, 10),
+			"user_id":     strconv.FormatInt(req.UserID, 10),
+			"system_code": systemCode,
 		},
 	}
 
@@ -696,7 +766,12 @@ func (s *Server) handleListUsage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能查看自己的用量，管理员可以查看任何人
-	if !canAccessUser(r.Context(), userID) {
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -725,7 +800,12 @@ func (s *Server) handleGetOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 权限验证：只能查看自己的订单，管理员可以查看任何人的
-	if !canAccessUser(r.Context(), order.UserID) {
+	allowed, err := s.canAccessUser(r.Context(), order.UserID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
 		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
@@ -980,6 +1060,14 @@ func (s *Server) handleAdminListUsers(w http.ResponseWriter, r *http.Request) {
 	page, pageSize := parsePagination(r)
 	systemCode := r.URL.Query().Get("system_code")
 	includeBalances := r.URL.Query().Get("include_balances") == "true"
+	if systemCode == "" {
+		resolvedSystemCode, err := s.resolveSystemCode(r.Context())
+		if err != nil {
+			s.respondServiceError(w, err)
+			return
+		}
+		systemCode = resolvedSystemCode
+	}
 
 	opts := services.ListUsersOptions{
 		Page:            page,
@@ -1012,6 +1100,15 @@ func (s *Server) handleAdminUpdateUserRole(w http.ResponseWriter, r *http.Reques
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
 
 	var req updateUserRoleRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -1038,6 +1135,15 @@ func (s *Server) handleAdminGetUserUsage(w http.ResponseWriter, r *http.Request)
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
 
 	from, to, err := parseRange(r)
 	if err != nil {
@@ -1060,6 +1166,15 @@ func (s *Server) handleAdminGetUserSubscriptions(w http.ResponseWriter, r *http.
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
+		return
+	}
 
 	subs, err := s.svc.GetUserSubscriptions(r.Context(), userID)
 	if err != nil {
@@ -1076,8 +1191,12 @@ func (s *Server) handleAdminGetStats(w http.ResponseWriter, r *http.Request) {
 		respondError(w, http.StatusBadRequest, err)
 		return
 	}
-
-	stats, err := s.svc.GetStats(r.Context(), from, to)
+	systemCode, err := s.resolveSystemCode(r.Context())
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	stats, err := s.svc.GetStats(r.Context(), from, to, systemCode)
 	if err != nil {
 		s.respondServiceError(w, err)
 		return
@@ -1090,6 +1209,15 @@ func (s *Server) handleAdminGetUserBalances(w http.ResponseWriter, r *http.Reque
 	userID, err := parseID(chi.URLParam(r, "id"))
 	if err != nil {
 		respondError(w, http.StatusBadRequest, err)
+		return
+	}
+	allowed, err := s.canAccessUser(r.Context(), userID)
+	if err != nil {
+		s.respondServiceError(w, err)
+		return
+	}
+	if !allowed {
+		respondError(w, http.StatusForbidden, errors.New("access denied"))
 		return
 	}
 
